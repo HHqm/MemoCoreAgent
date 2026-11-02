@@ -10,7 +10,7 @@ class CliTest(unittest.TestCase):
         args = build_parser().parse_args(["run", "--system", "naive_rag"])
         self.assertEqual(args.categories, (1, 2, 3, 4))
         self.assertEqual(args.top_k, 20)
-        self.assertEqual(args.judge, "both")
+        self.assertEqual(args.judge, "strict")
         self.assertEqual(build_parser().parse_args(["run", "--system", "naive_rag", "--categories", "1,5"]).categories, (1, 5))
 
     def test_user_errors_print_a_message_instead_of_a_traceback(self):

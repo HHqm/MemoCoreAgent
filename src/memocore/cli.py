@@ -63,13 +63,15 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--no-time-anchors", action="store_true", help="hybrid_rag 关闭写入时的时间锚定")
     run.add_argument("--neighbors", type=int, default=0, help="hybrid_rag 每个命中额外带上前后几轮")
     run.add_argument("--max-per-session", type=int, help="hybrid_rag 每个会话最多命中几次")
-    run.add_argument("--judge", choices=(*JUDGE_KINDS, "both", "none"), default="both")
+    run.add_argument(
+        "--judge", choices=(*JUDGE_KINDS, "both", "none"), default="strict", help="默认只跑严格裁判以节省额度"
+    )
     run.add_argument("--workers", type=int, default=8)
     run.add_argument("--mock", action="store_true", help="离线占位模型，只检查流程，不调用 API")
 
     judge = sub.add_parser("judge", help="对已有运行补做裁判")
     judge.add_argument("--run-name", required=True)
-    judge.add_argument("--kind", choices=(*JUDGE_KINDS, "both"), default="both")
+    judge.add_argument("--kind", choices=(*JUDGE_KINDS, "both"), default="strict")
     judge.add_argument("--workers", type=int, default=8)
 
     report = sub.add_parser("report", help="重新生成汇总表")

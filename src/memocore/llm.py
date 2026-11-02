@@ -28,6 +28,8 @@ class Completion:
     usage: Usage
     latency_s: float
     from_cache: bool = False
+    # "length" means the token cap cut the reply off; thinking models spend part of it on reasoning.
+    finish_reason: str | None = None
 
 
 class ChatModel(Protocol):
@@ -62,11 +64,22 @@ class ResponseCache:
         if row is None:
             return None
         data = json.loads(row[0])
-        return Completion(text=data["text"], usage=Usage(**data["usage"]), latency_s=data["latency_s"], from_cache=True)
+        return Completion(
+            text=data["text"],
+            usage=Usage(**data["usage"]),
+            latency_s=data["latency_s"],
+            from_cache=True,
+            finish_reason=data.get("finish_reason"),
+        )
 
     def put(self, key: str, completion: Completion) -> None:
         payload = json.dumps(
-            {"text": completion.text, "usage": asdict(completion.usage), "latency_s": completion.latency_s},
+            {
+                "text": completion.text,
+                "usage": asdict(completion.usage),
+                "latency_s": completion.latency_s,
+                "finish_reason": completion.finish_reason,
+            },
             ensure_ascii=False,
         )
         with self._lock:
@@ -103,12 +116,15 @@ class OpenAICompatibleChat:
         response = self._client.chat.completions.create(
             model=self.model, messages=messages, max_tokens=max_tokens, temperature=temperature
         )
+        choice = response.choices[0]
         completion = Completion(
-            text=(response.choices[0].message.content or "").strip(),
+            text=(choice.message.content or "").strip(),
             usage=_usage(response.usage),
             latency_s=time.perf_counter() - start,
+            finish_reason=choice.finish_reason,
         )
-        if self._cache and key:
+        # A truncated reply is not cached, so a rerun with a larger cap can retry it.
+        if self._cache and key and choice.finish_reason != "length":
             self._cache.put(key, completion)
         return completion
 

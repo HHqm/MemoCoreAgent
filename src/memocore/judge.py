@@ -17,7 +17,7 @@ from memocore.llm import Message
 from memocore.metrics import normalize_answer
 
 JUDGE_KINDS = ("strict", "lenient")
-JUDGE_MAX_TOKENS = 200
+JUDGE_MAX_TOKENS = 2048  # covers a thinking model's reasoning as well as the JSON verdict
 
 _HEADER = """You are grading an answer to a question about a long conversation between two people.
 
@@ -67,6 +67,28 @@ def judge_messages(kind: str, question: str, gold: str, prediction: str) -> list
         + _FOOTER.format(abstain=ABSTAIN_ANSWER)
     )
     return [{"role": "user", "content": prompt}]
+
+
+def _abstains(text: str) -> bool:
+    words = normalize_answer(text).split()
+    # A short reply that only declines; longer ones may decline and then answer anyway.
+    return len(words) <= 8 and " ".join(words).startswith(("not mentioned", "no information"))
+
+
+def rule_verdict(gold: str, prediction: str) -> Verdict | None:
+    """Decide the clear-cut cases without calling the judge model; None means the model is needed.
+
+    Abstentions and exact matches are unambiguous under both rubrics, and they are common: a system
+    without memory abstains on nearly every question, so this alone removes most of its judge calls.
+    """
+    gold_abstains = normalize_answer(gold) == normalize_answer(ABSTAIN_ANSWER)
+    if gold_abstains:
+        return Verdict("CORRECT" if _abstains(prediction) else "WRONG", "rule: unanswerable question")
+    if _abstains(prediction):
+        return Verdict("WRONG", "rule: abstained although the gold answer gives the information")
+    if normalize_answer(prediction) == normalize_answer(gold):
+        return Verdict("CORRECT", "rule: exact match after normalisation")
+    return None
 
 
 def parse_verdict(text: str) -> Verdict:

@@ -7,7 +7,8 @@ import hashlib
 from memocore.datasets.locomo import ABSTAIN_ANSWER, Conversation
 from memocore.llm import Message
 
-ANSWER_MAX_TOKENS = 200
+# Generous because DeepSeek's current models think before answering and the cap covers both.
+ANSWER_MAX_TOKENS = 2048
 
 ANSWER_SYSTEM = "You answer questions about long-running conversations between two people, using only the memory you are given."
 
@@ -20,10 +21,10 @@ ANSWER_TEMPLATE = """Below is memory from conversations between {speaker_a} and 
 </memory>
 
 Instructions:
-- Answer using only the memory above.
-- Relative times such as "yesterday" or "last week" are relative to the date of the conversation they were said in; convert them to an absolute date or period.
+- Answer using only the memory above. Bracketed notes, such as a shared image's description or a resolved time, are part of the memory.
+- Relative times such as "yesterday" or "last week" are relative to the date of the conversation they were said in; convert them to an absolute date or period, or state them relative to that date (for example "the week before 9 June 2023"). Never include the clock time of a conversation.
 - If the question asks what is likely or probable, reason from the memory and give your best answer.
-- Reply with a short phrase (ideally under 10 words), not a full sentence.
+- Reply with a short phrase (ideally under 10 words), not a full sentence. Answer only what is asked: no reasons, examples or extra details the question does not ask for.
 - If the memory does not contain the information, reply exactly: {abstain}.
 
 Question: {question}

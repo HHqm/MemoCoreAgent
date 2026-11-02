@@ -44,7 +44,7 @@ class Settings:
     @classmethod
     def from_env(cls, root: Path = PROJECT_ROOT) -> "Settings":
         load_dotenv(root / ".env", override=False)
-        answer_model = _env_or("MEMOCORE_ANSWER_MODEL", "deepseek-chat")
+        answer_model = _env_or("MEMOCORE_ANSWER_MODEL", "deepseek-flash")
         return cls(
             api_key=_env("MEMOCORE_API_KEY") or _env("DEEPSEEK_API_KEY"),
             base_url=_env_or("MEMOCORE_BASE_URL", "https://api.deepseek.com"),

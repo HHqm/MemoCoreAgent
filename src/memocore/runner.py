@@ -9,6 +9,7 @@ from __future__ import annotations
 import csv
 import json
 import random
+import sys
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -24,7 +25,14 @@ from memocore.config import Settings
 from memocore.datasets.locomo import CATEGORY_NAMES, DEFAULT_CATEGORIES, Conversation, LocomoSample, QAItem, load_locomo
 from memocore.embeddings import CachedEmbedder, Embedder, HashingEmbedder, SentenceTransformerEmbedder
 from memocore.jsonl import JsonlWriter, read_jsonl
-from memocore.judge import JUDGE_KINDS, JUDGE_MAX_TOKENS, judge_messages, mock_judge_responder, parse_verdict
+from memocore.judge import (
+    JUDGE_KINDS,
+    JUDGE_MAX_TOKENS,
+    judge_messages,
+    mock_judge_responder,
+    parse_verdict,
+    rule_verdict,
+)
 from memocore.llm import ChatModel, Message, MockChat, OpenAICompatibleChat, ResponseCache
 from memocore.metrics import answer_visible, evidence_recall, locomo_f1
 from memocore.prompts import ANSWER_MAX_TOKENS, PROMPT_VERSION, answer_messages
@@ -148,6 +156,8 @@ def run_predictions(
     pred_path = run_dir / PREDICTIONS
     done = {row["qa_id"] for row in read_jsonl(pred_path)}
     total = sum(qa.qa_id not in done for _, questions in selected for qa in questions)
+    if progress:
+        print(f"回答[{cfg.system}]：已完成 {len(done)} 题，本次调用回答模型 {total} 次", file=sys.stderr)
 
     with (
         JsonlWriter(pred_path) as predictions,
@@ -183,10 +193,14 @@ def run_predictions(
                 start = time.perf_counter()
                 context = system.retrieve(qa.question)
                 jobs.append((qa, context, time.perf_counter() - start))
+            # Answer one question alone first: with a shared prompt prefix (full_context) this lets the
+            # provider build its prefix cache before the rest arrive in parallel and would all miss it.
+            predictions.write(_answer_one(chat, conversation, *jobs[0]))
+            bar.update(1)
             with ThreadPoolExecutor(max_workers=workers) as pool:
                 futures = [
                     pool.submit(_answer_one, chat, conversation, qa, context, retrieve_s)
-                    for qa, context, retrieve_s in jobs
+                    for qa, context, retrieve_s in jobs[1:]
                 ]
                 for future in as_completed(futures):
                     predictions.write(future.result())
@@ -253,6 +267,7 @@ def _answer_one(
         "answer_latency_s": round(completion.latency_s, 4),
         "retrieve_latency_s": round(retrieve_s, 4),
         "from_cache": completion.from_cache,
+        "finish_reason": completion.finish_reason,
     }
 
 
@@ -270,8 +285,13 @@ def run_judge(
     run_dir = existing_run(settings, run_name)
     info = json.loads((run_dir / RUN_INFO).read_text(encoding="utf-8"))
     out = judge_path(run_dir, kind)
-    done = {row["qa_id"] for row in read_jsonl(out)}
+    # Unparsed verdicts are redone; summaries keep the last line written for each question.
+    done = {row["qa_id"] for row in read_jsonl(out) if row["label"] is not None}
     todo = [row for row in read_jsonl(run_dir / PREDICTIONS) if row["qa_id"] not in done]
+    if progress:
+        by_rule = sum(rule_verdict(row["gold"], row["prediction"]) is not None for row in todo)
+        print(f"裁判[{kind}]：待判 {len(todo)} 题，规则直接判定 {by_rule} 题，调用裁判模型 {len(todo) - by_rule} 次",
+              file=sys.stderr)
     # A mock run is graded by the mock judge, so its placeholder answers never reach a paid API.
     chat = chat or build_chat(settings, settings.judge_model, mock=info.get("mock", False), responder=mock_judge_responder)
     with (
@@ -287,8 +307,21 @@ def run_judge(
 
 
 def _judge_one(chat: ChatModel, kind: str, prediction: dict[str, Any]) -> dict[str, Any]:
+    verdict = rule_verdict(prediction["gold"], prediction["prediction"])
+    if verdict is not None:
+        return {
+            "qa_id": prediction["qa_id"],
+            "label": verdict.label,
+            "correct": verdict.correct,
+            "reasoning": verdict.reasoning,
+            "judge_model": "rule",
+            "finish_reason": None,
+        }
     messages: list[Message] = judge_messages(kind, prediction["question"], prediction["gold"], prediction["prediction"])
     completion = chat.complete(messages, max_tokens=JUDGE_MAX_TOKENS, temperature=0.0)
+    if completion.finish_reason == "length":
+        # About 2% of the time the thinking judge spends the whole cap on reasoning; one larger retry.
+        completion = chat.complete(messages, max_tokens=JUDGE_MAX_TOKENS * 2, temperature=0.0)
     verdict = parse_verdict(completion.text)
     return {
         "qa_id": prediction["qa_id"],
@@ -296,6 +329,7 @@ def _judge_one(chat: ChatModel, kind: str, prediction: dict[str, Any]) -> dict[s
         "correct": verdict.correct,
         "reasoning": verdict.reasoning,
         "judge_model": chat.model,
+        "finish_reason": completion.finish_reason,
         "prompt_tokens": completion.usage.prompt_tokens,
         "cached_prompt_tokens": completion.usage.cached_prompt_tokens,
         "completion_tokens": completion.usage.completion_tokens,
@@ -344,11 +378,18 @@ def _group_stats(rows: list[dict[str, Any]], verdicts: dict[str, dict[str, dict[
         stats[f"judge_{kind}"] = _mean(correct)
         stats[f"judge_{kind}_ci"] = bootstrap_ci(correct)
         stats[f"judge_{kind}_n"] = len(judged)
+        # Error attribution: a wrong answer either lacked evidence in its context or had it all and still failed.
+        wrong = [row for row in rows if row["qa_id"] in by_id and not by_id[row["qa_id"]]["correct"]]
+        stats[f"judge_{kind}_wrong_missing_evidence"] = sum(
+            row["evidence_recall"] is not None and row["evidence_recall"] < 1.0 for row in wrong
+        )
+        stats[f"judge_{kind}_wrong_with_evidence"] = sum(row["evidence_recall"] == 1.0 for row in wrong)
         stats[f"judge_{kind}_unparsed"] = sum(verdict["label"] is None for verdict in judged)
     stats["evidence_recall"] = _mean(row["evidence_recall"] for row in rows if row["evidence_recall"] is not None)
     stats["answer_visible"] = _mean(
         float(row["answer_visible"]) for row in rows if row.get("answer_visible") is not None
     )
+    stats["truncated"] = sum(row.get("finish_reason") == "length" for row in rows)
     stats["context_turns"] = _mean(row["context_turns"] for row in rows)
     stats["prompt_tokens"] = _mean(row["prompt_tokens"] for row in rows)
     latencies = [row["answer_latency_s"] for row in rows]
@@ -406,6 +447,19 @@ def render_markdown(summary: dict[str, Any]) -> str:
     shown = [f"{label} [{ci[0] * 100:.1f}%, {ci[1] * 100:.1f}%]" for label, ci in intervals if ci]
     if shown:
         lines += ["", "整体 95% 置信区间（按题 bootstrap 2000 次）：" + "；".join(shown)]
+    if "judge_strict_n" in overall:
+        lines += [
+            "",
+            "严格裁判下的错误归因：",
+            "",
+            "| 题型 | 答错 | 证据没召回全 | 证据齐全却答错 |",
+            "|---|---:|---:|---:|",
+        ]
+        for name, stats in summary["groups"].items():
+            missing = stats.get("judge_strict_wrong_missing_evidence", 0)
+            complete = stats.get("judge_strict_wrong_with_evidence", 0)
+            wrong = round(stats["judge_strict_n"] * (1 - (stats.get("judge_strict") or 0)))
+            lines.append(f"| {name} | {wrong} | {missing} | {complete} |")
     lines += ["", "Token 合计（prompt / 其中命中前缀缓存 / completion）：", ""]
     for stage, totals in summary["tokens"].items():
         lines.append(
@@ -415,6 +469,8 @@ def render_markdown(summary: dict[str, Any]) -> str:
     unparsed = {kind: summary["groups"]["overall"].get(f"judge_{kind}_unparsed", 0) for kind in JUDGE_KINDS}
     if any(unparsed.values()):
         lines += ["", f"裁判输出无法解析的条数（计为错误）：{unparsed}"]
+    if summary["groups"]["overall"].get("truncated"):
+        lines += ["", f"回答被输出上限截断的条数：{summary['groups']['overall']['truncated']}"]
     return "\n".join(lines) + "\n"
 
 
