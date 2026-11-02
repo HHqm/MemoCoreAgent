@@ -26,9 +26,11 @@ from memocore.embeddings import CachedEmbedder, Embedder, HashingEmbedder, Sente
 from memocore.jsonl import JsonlWriter, read_jsonl
 from memocore.judge import JUDGE_KINDS, JUDGE_MAX_TOKENS, judge_messages, mock_judge_responder, parse_verdict
 from memocore.llm import ChatModel, Message, MockChat, OpenAICompatibleChat, ResponseCache
-from memocore.metrics import evidence_recall, locomo_f1
+from memocore.metrics import answer_visible, evidence_recall, locomo_f1
 from memocore.prompts import ANSWER_MAX_TOKENS, PROMPT_VERSION, answer_messages
-from memocore.systems import NEEDS_EMBEDDER, RetrievedContext, build_system
+from memocore.retrieval.rerank import CrossEncoderReranker, LexicalReranker, Reranker
+from memocore.stats import bootstrap_ci
+from memocore.systems import NEEDS_EMBEDDER, HybridOptions, RetrievedContext, build_system
 
 PREDICTIONS = "predictions.jsonl"
 INGEST_LOG = "ingest.jsonl"
@@ -55,8 +57,24 @@ class RunConfig:
     # Chosen from `memocore retrieval-sweep`: at a fixed context budget, one-turn chunks recall the
     # most evidence, and 20 of them (about 3% of a conversation) recall 76% of it with bge-m3.
     top_k: int = 20
-    chunk_turns: int = 1
+    chunk_turns: int = 1  # naive_rag only
+    # hybrid_rag only; see `memocore retrieval-ablation` for how each one moves evidence recall.
+    fusion: str = "pool"
+    rerank_candidates: int = 50
+    neighbors: int = 0
+    max_per_session: int | None = None
+    time_anchors: bool = True
     mock: bool = False
+
+    @property
+    def hybrid(self) -> HybridOptions:
+        return HybridOptions(
+            fusion=self.fusion,
+            rerank_candidates=self.rerank_candidates,
+            neighbors=self.neighbors,
+            max_per_session=self.max_per_session,
+            time_anchors=self.time_anchors,
+        )
 
 
 def judge_path(run_dir: Path, kind: str) -> Path:
@@ -66,6 +84,12 @@ def judge_path(run_dir: Path, kind: str) -> Path:
 def build_embedder(settings: Settings) -> Embedder:
     inner = SentenceTransformerEmbedder(settings.embedding_model, device=settings.embedding_device)
     return CachedEmbedder(inner, settings.embedding_cache_path)
+
+
+def build_reranker(settings: Settings) -> Reranker:
+    return CrossEncoderReranker(
+        settings.reranker_model, device=settings.embedding_device, cache_path=settings.rerank_cache_path
+    )
 
 
 def build_chat(
@@ -103,6 +127,7 @@ def run_predictions(
     *,
     chat: ChatModel | None = None,
     embedder: Embedder | None = None,
+    reranker: Reranker | None = None,
     workers: int = 8,
     progress: bool = True,
 ) -> Path:
@@ -113,7 +138,11 @@ def run_predictions(
         embedder = None
     elif embedder is None:
         embedder = HashingEmbedder() if cfg.mock else build_embedder(settings)
-    _check_identity(run_dir, _identity(cfg, chat, embedder))
+    if cfg.system != "hybrid_rag" or not cfg.rerank_candidates:
+        reranker = None
+    elif reranker is None:
+        reranker = LexicalReranker() if cfg.mock else build_reranker(settings)
+    _check_identity(run_dir, _identity(cfg, chat, embedder, reranker))
 
     selected = select_questions(load_locomo(settings.locomo_path), cfg)
     pred_path = run_dir / PREDICTIONS
@@ -130,7 +159,14 @@ def run_predictions(
             if not todo:
                 continue
             conversation = sample.conversation
-            system = build_system(cfg.system, embedder=embedder, top_k=cfg.top_k, chunk_turns=cfg.chunk_turns)
+            system = build_system(
+                cfg.system,
+                embedder=embedder,
+                reranker=reranker,
+                top_k=cfg.top_k,
+                chunk_turns=cfg.chunk_turns,
+                hybrid=cfg.hybrid,
+            )
             start = time.perf_counter()
             system.ingest(conversation)
             ingest_log.write(
@@ -158,16 +194,25 @@ def run_predictions(
     return pred_path
 
 
-def _identity(cfg: RunConfig, chat: ChatModel, embedder: Embedder | None) -> dict[str, Any]:
+def _identity(
+    cfg: RunConfig, chat: ChatModel, embedder: Embedder | None, reranker: Reranker | None
+) -> dict[str, Any]:
     retrieval = cfg.system in NEEDS_EMBEDDER
+    hybrid = cfg.system == "hybrid_rag"
     return {
         "system": cfg.system,
         "answer_model": chat.model,
         "prompt_version": PROMPT_VERSION,
         "mock": cfg.mock,
         "top_k": cfg.top_k if retrieval else None,
-        "chunk_turns": cfg.chunk_turns if retrieval else None,
+        "chunk_turns": cfg.chunk_turns if cfg.system == "naive_rag" else None,
         "embedding_model": embedder.name if embedder else None,
+        "fusion": cfg.fusion if hybrid else None,
+        "rerank_candidates": cfg.rerank_candidates if hybrid else None,
+        "neighbors": cfg.neighbors if hybrid else None,
+        "max_per_session": cfg.max_per_session if hybrid else None,
+        "time_anchors": cfg.time_anchors if hybrid else None,
+        "reranker_model": reranker.name if reranker else None,
     }
 
 
@@ -199,6 +244,7 @@ def _answer_one(
         "f1": locomo_f1(completion.text, qa.gold, qa.category),
         "evidence": list(qa.evidence),
         "evidence_recall": evidence_recall(qa.evidence, context.turn_ids),
+        "answer_visible": answer_visible(qa.gold, context.text, qa.category),
         "context_turns": len(context.turn_ids),
         "retrieved_ids": list(context.turn_ids) if len(context.turn_ids) <= MAX_STORED_IDS else None,
         "prompt_tokens": completion.usage.prompt_tokens,
@@ -221,7 +267,7 @@ def run_judge(
 ) -> Path:
     if kind not in JUDGE_KINDS:
         raise ValueError(f"unknown judge {kind!r}; choose from {', '.join(JUDGE_KINDS)}")
-    run_dir = _existing_run(settings, run_name)
+    run_dir = existing_run(settings, run_name)
     info = json.loads((run_dir / RUN_INFO).read_text(encoding="utf-8"))
     out = judge_path(run_dir, kind)
     done = {row["qa_id"] for row in read_jsonl(out)}
@@ -257,7 +303,7 @@ def _judge_one(chat: ChatModel, kind: str, prediction: dict[str, Any]) -> dict[s
 
 
 def summarize(run_name: str, settings: Settings) -> dict[str, Any]:
-    run_dir = _existing_run(settings, run_name)
+    run_dir = existing_run(settings, run_name)
     info = json.loads((run_dir / RUN_INFO).read_text(encoding="utf-8"))
     predictions = list(read_jsonl(run_dir / PREDICTIONS))
     verdicts = {
@@ -290,13 +336,19 @@ def _mean(values: Iterable[float]) -> float | None:
 
 
 def _group_stats(rows: list[dict[str, Any]], verdicts: dict[str, dict[str, dict[str, Any]]]) -> dict[str, Any]:
-    stats: dict[str, Any] = {"n": len(rows), "f1": _mean(row["f1"] for row in rows)}
+    f1 = [row["f1"] for row in rows]
+    stats: dict[str, Any] = {"n": len(rows), "f1": _mean(f1), "f1_ci": bootstrap_ci(f1)}
     for kind, by_id in verdicts.items():
         judged = [by_id[row["qa_id"]] for row in rows if row["qa_id"] in by_id]
-        stats[f"judge_{kind}"] = _mean(1.0 if verdict["correct"] else 0.0 for verdict in judged)
+        correct = [1.0 if verdict["correct"] else 0.0 for verdict in judged]
+        stats[f"judge_{kind}"] = _mean(correct)
+        stats[f"judge_{kind}_ci"] = bootstrap_ci(correct)
         stats[f"judge_{kind}_n"] = len(judged)
         stats[f"judge_{kind}_unparsed"] = sum(verdict["label"] is None for verdict in judged)
     stats["evidence_recall"] = _mean(row["evidence_recall"] for row in rows if row["evidence_recall"] is not None)
+    stats["answer_visible"] = _mean(
+        float(row["answer_visible"]) for row in rows if row.get("answer_visible") is not None
+    )
     stats["context_turns"] = _mean(row["context_turns"] for row in rows)
     stats["prompt_tokens"] = _mean(row["prompt_tokens"] for row in rows)
     latencies = [row["answer_latency_s"] for row in rows]
@@ -324,21 +376,36 @@ def _num(value: float | None, digits: int = 0) -> str:
 def render_markdown(summary: dict[str, Any]) -> str:
     info = summary["info"]
     meta = [f"系统 `{info['system']}`", f"回答模型 `{info['answer_model']}`", f"Prompt `{info['prompt_version']}`"]
-    if info.get("top_k") is not None:
+    if info.get("chunk_turns") is not None:
         meta.append(f"top_k={info['top_k']}，每块 {info['chunk_turns']} 轮，向量模型 `{Path(info['embedding_model']).name}`")
+    if info.get("rerank_candidates") is not None:
+        reranker = Path(info["reranker_model"]).name if info.get("reranker_model") else "无"
+        meta.append(
+            f"预算 {info['top_k']} 轮，BM25 {info.get('fusion')}，重排候选 {info['rerank_candidates']}（`{reranker}`），"
+            f"邻近 ±{info['neighbors']} 轮，每会话上限 {info['max_per_session'] or '不限'}，"
+            f"时间锚定 {'开' if info.get('time_anchors') else '关'}"
+        )
     lines = [f"# 评测结果：{summary['run']}", "", " · ".join(meta), ""]
     if info.get("mock"):
         lines += ["> **这是 --mock 离线运行：回答和裁判都是占位，数字只用来检查流程，没有任何意义。**", ""]
     lines += [
-        "| 题型 | 题数 | F1 | 严格裁判 | 宽松裁判 | 证据召回 | 平均上下文轮数 | 平均 prompt token | 延迟 P50 / P95 (s) |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| 题型 | 题数 | F1 | 严格裁判 | 宽松裁判 | 证据召回 | 答案可见 | 平均上下文轮数 | 平均 prompt token | 延迟 P50 / P95 (s) |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for name, stats in summary["groups"].items():
         lines.append(
             f"| {name} | {stats['n']} | {_pct(stats['f1'])} | {_pct(stats.get('judge_strict'))} | "
-            f"{_pct(stats.get('judge_lenient'))} | {_pct(stats['evidence_recall'])} | {_num(stats['context_turns'], 1)} | "
+            f"{_pct(stats.get('judge_lenient'))} | {_pct(stats['evidence_recall'])} | "
+            f"{_pct(stats.get('answer_visible'))} | {_num(stats['context_turns'], 1)} | "
             f"{_num(stats['prompt_tokens'])} | {_num(stats['latency_p50_s'], 2)} / {_num(stats['latency_p95_s'], 2)} |"
         )
+    overall = summary["groups"]["overall"]
+    intervals = [("F1", overall.get("f1_ci"))] + [
+        (label, overall.get(f"judge_{kind}_ci")) for kind, label in (("strict", "严格裁判"), ("lenient", "宽松裁判"))
+    ]
+    shown = [f"{label} [{ci[0] * 100:.1f}%, {ci[1] * 100:.1f}%]" for label, ci in intervals if ci]
+    if shown:
+        lines += ["", "整体 95% 置信区间（按题 bootstrap 2000 次）：" + "；".join(shown)]
     lines += ["", "Token 合计（prompt / 其中命中前缀缓存 / completion）：", ""]
     for stage, totals in summary["tokens"].items():
         lines.append(
@@ -351,7 +418,7 @@ def render_markdown(summary: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _existing_run(settings: Settings, run_name: str) -> Path:
+def existing_run(settings: Settings, run_name: str) -> Path:
     run_dir = settings.runs_dir / run_name
     if not (run_dir / RUN_INFO).exists():
         raise FileNotFoundError(f"找不到运行 {run_name!r}（{run_dir}），请先执行 memocore run。")
@@ -367,7 +434,7 @@ _HUMAN_LABELS = {
 
 def export_audit(run_name: str, kind: str, settings: Settings, *, n: int = 100, seed: int = 0) -> Path:
     """Write a random sample of judged answers to CSV for a human to label in the human_label column."""
-    run_dir = _existing_run(settings, run_name)
+    run_dir = existing_run(settings, run_name)
     verdicts = list(read_jsonl(judge_path(run_dir, kind)))
     if not verdicts:
         raise FileNotFoundError(f"运行 {run_name!r} 还没有 {kind} 裁判结果，请先执行 memocore judge。")

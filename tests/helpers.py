@@ -23,8 +23,10 @@ def temp_settings(test_case) -> Settings:
         judge_model="unused",
         embedding_model="unused",
         embedding_device=None,
+        reranker_model="unused",
         data_dir=data_dir,
         runs_dir=root / "runs",
         cache_path=root / "cache.sqlite",
         embedding_cache_path=root / "embeddings.sqlite",
+        rerank_cache_path=root / "rerank.sqlite",
     )

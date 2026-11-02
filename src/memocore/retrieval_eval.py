@@ -1,4 +1,4 @@
-"""Retrieval-only evaluation: how much gold evidence naive RAG puts in context, with no LLM calls.
+"""Retrieval-only evaluation: how much gold evidence a read path puts in context, with no LLM calls.
 
 It costs nothing to run, so retrieval settings can be tuned before any API money is spent, and it
 later separates "the memory never surfaced the fact" from "the model failed to use it".
@@ -17,12 +17,15 @@ from tqdm import tqdm
 from memocore.config import Settings
 from memocore.datasets.locomo import CATEGORY_NAMES, DEFAULT_CATEGORIES, load_locomo
 from memocore.embeddings import Embedder
-from memocore.metrics import evidence_recall
-from memocore.runner import RunConfig, build_embedder, select_questions
-from memocore.systems import NaiveRAGSystem
+from memocore.metrics import answer_visible, evidence_recall
+from memocore.retrieval.rerank import CrossEncoderReranker, Reranker
+from memocore.runner import RunConfig, build_embedder, build_reranker, select_questions
+from memocore.systems import HybridOptions, HybridRAGSystem, NaiveRAGSystem
 
 SWEEP_JSON = "retrieval_sweep.json"
 SWEEP_MD = "retrieval_sweep.md"
+ABLATION_JSON = "retrieval_ablation.json"
+ABLATION_MD = "retrieval_ablation.md"
 
 
 def retrieval_sweep(
@@ -70,18 +73,12 @@ def retrieval_sweep(
                     if recall is not None:
                         recalls[k][qa.category].append(recall)
         for k in ks:
-            everything = [value for values in recalls[k].values() for value in values]
             rows.append(
                 {
                     "chunk_turns": size,
                     "top_k": k,
                     "context_turns": fmean(context_turns[k]) if context_turns[k] else 0.0,
-                    "recall": fmean(everything) if everything else None,
-                    "all_evidence_rate": fmean(value == 1.0 for value in everything) if everything else None,
-                    "by_category": {
-                        CATEGORY_NAMES.get(category, str(category)): fmean(values)
-                        for category, values in sorted(recalls[k].items())
-                    },
+                    **_recall_stats(recalls[k]),
                 }
             )
         timing.append(
@@ -103,6 +100,157 @@ def retrieval_sweep(
     return result
 
 
+def _recall_stats(by_category: dict[int, list[float]]) -> dict[str, Any]:
+    everything = [value for values in by_category.values() for value in values]
+    return {
+        "recall": fmean(everything) if everything else None,
+        "all_evidence_rate": fmean(value == 1.0 for value in everything) if everything else None,
+        "by_category": {
+            CATEGORY_NAMES.get(category, str(category)): fmean(values) for category, values in sorted(by_category.items())
+        },
+    }
+
+
+# Each configuration adds or swaps one stage, so adjacent rows isolate a single change at the same budget.
+# A first round also tried BM25 alone, neighbour expansion and a per-session cap (docs/results).
+ABLATION_CONFIGS: dict[str, HybridOptions] = {
+    "dense": HybridOptions(use_bm25=False),
+    "dense+bm25(rrf)": HybridOptions(),
+    "dense+rerank20": HybridOptions(use_bm25=False, rerank_candidates=20),
+    "dense+rerank50": HybridOptions(use_bm25=False, rerank_candidates=50),
+    "dense+bm25(rrf)+rerank50": HybridOptions(rerank_candidates=50),
+    "dense+bm25(pool)+rerank50": HybridOptions(fusion="pool", rerank_candidates=50),
+    "dense+rerank50+time": HybridOptions(use_bm25=False, rerank_candidates=50, time_anchors=True),
+    "dense+bm25(pool)+rerank50+time": HybridOptions(fusion="pool", rerank_candidates=50, time_anchors=True),
+}
+
+
+def retrieval_ablation(
+    settings: Settings,
+    *,
+    budgets: Sequence[int] = (5, 10, 20),
+    configs: dict[str, HybridOptions] | None = None,
+    categories: Sequence[int] = DEFAULT_CATEGORIES,
+    embedder: Embedder | None = None,
+    reranker: Reranker | None = None,
+    progress: bool = True,
+) -> dict[str, Any]:
+    """Evidence recall of each read-path configuration at the same turn budgets. No LLM calls."""
+    configs = configs or ABLATION_CONFIGS
+    budgets = sorted(set(budgets))
+    selected = select_questions(
+        load_locomo(settings.locomo_path),
+        RunConfig(system="hybrid_rag", run_name="retrieval-ablation", categories=tuple(categories)),
+    )
+    embedder = embedder or build_embedder(settings)
+    if reranker is None and any(options.rerank_candidates for options in configs.values()):
+        reranker = build_reranker(settings)
+
+    rows, rank_ms = [], {}
+    for name, options in configs.items():
+        recalls: dict[int, dict[int, list[float]]] = defaultdict(lambda: defaultdict(list))
+        visible: dict[int, dict[int, list[float]]] = defaultdict(lambda: defaultdict(list))
+        chars: dict[int, list[int]] = defaultdict(list)
+        rank_s, queries = 0.0, 0
+        for sample, questions in tqdm(selected, desc=name, disable=not progress):
+            system = HybridRAGSystem(
+                embedder if options.use_dense else None,
+                reranker if options.rerank_candidates else None,
+                top_k=budgets[-1],
+                options=options,
+            )
+            system.ingest(sample.conversation)
+            start = time.perf_counter()
+            rankings = system.rank([qa.question for qa in questions])
+            rank_s += time.perf_counter() - start
+            queries += len(questions)
+            for qa, ranked in zip(questions, rankings):
+                for budget in budgets:
+                    context = system.render(system.select(ranked, budget))
+                    chars[budget].append(len(context.text))
+                    recall = evidence_recall(qa.evidence, context.turn_ids)
+                    if recall is not None:
+                        recalls[budget][qa.category].append(recall)
+                    seen = answer_visible(qa.gold, context.text, qa.category)
+                    if seen is not None:
+                        visible[budget][qa.category].append(1.0 if seen else 0.0)
+        for budget in budgets:
+            shown = _recall_stats(visible[budget])
+            rows.append(
+                {
+                    "config": name,
+                    "budget": budget,
+                    **_recall_stats(recalls[budget]),
+                    "answer_visible": shown["recall"],
+                    "answer_visible_by_category": shown["by_category"],
+                    "context_chars": fmean(chars[budget]) if chars[budget] else 0.0,
+                }
+            )
+        rank_ms[name] = round(1000 * rank_s / max(queries, 1), 2)
+
+    result: dict[str, Any] = {
+        "embedding_model": embedder.name,
+        "reranker_model": reranker.name if reranker else None,
+        "categories": list(categories),
+        "questions": sum(len(questions) for _, questions in selected),
+        "budgets": budgets,
+        "rows": rows,
+        "rank_ms_per_question": rank_ms,
+    }
+    if isinstance(reranker, CrossEncoderReranker) and reranker.pairs_scored:
+        result["reranker_pairs_per_second"] = round(reranker.pairs_scored / reranker.model_seconds, 1)
+    settings.runs_dir.mkdir(parents=True, exist_ok=True)
+    (settings.runs_dir / ABLATION_JSON).write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    (settings.runs_dir / ABLATION_MD).write_text(render_ablation(result), encoding="utf-8")
+    return result
+
+
+def _short(model: str | None) -> str:
+    return "—" if not model else model.replace("\\", "/").rsplit("/", 1)[-1]
+
+
+def render_ablation(result: dict[str, Any]) -> str:
+    rows = result["rows"]
+    category_names = list(rows[0]["by_category"]) if rows else []
+    lines = [
+        "# 读取路径消融：同一上下文预算下的证据召回（不调用 LLM）",
+        "",
+        f"向量模型 `{_short(result['embedding_model'])}` · 重排模型 `{_short(result['reranker_model'])}` · "
+        f"共 {result['questions']} 题 · 预算 = 放进上下文的对话轮数",
+        "",
+        "答案可见 = 标准答案的每个词都出现在上下文里（不调用 LLM 的代理指标，主要用来衡量时间锚定）。",
+    ]
+    for budget in result["budgets"]:
+        at_budget = [row for row in rows if row["budget"] == budget]
+        base = next((row["recall"] for row in at_budget if row["config"] == "dense"), None)
+        lines += [
+            "",
+            f"## 预算 {budget} 轮",
+            "",
+            "| 配置 | 证据召回 | 比 dense | 证据全部召回的题占比 | "
+            + " | ".join(category_names)
+            + " | 答案可见 | temporal 答案可见 | 平均上下文字符 |",
+            "|---|---:|---:|---:|" + "---:|" * len(category_names) + "---:|---:|---:|",
+        ]
+        for row in at_budget:
+            delta = "—" if base is None or row["recall"] is None else f"{(row['recall'] - base) * 100:+.1f}"
+            cells = " | ".join(_pct(row["by_category"].get(name)) for name in category_names)
+            temporal_visible = row.get("answer_visible_by_category", {}).get("temporal")
+            lines.append(
+                f"| {row['config']} | {_pct(row['recall'])} | {delta} | {_pct(row['all_evidence_rate'])} | {cells} | "
+                f"{_pct(row.get('answer_visible'))} | {_pct(temporal_visible)} | {row.get('context_chars', 0):,.0f} |"
+            )
+    lines += ["", "单题排序耗时（毫秒，向量与重排分数命中磁盘缓存时会更快）："]
+    lines += [f"- {name}：{ms}" for name, ms in result["rank_ms_per_question"].items()]
+    if result.get("reranker_pairs_per_second"):
+        per_question = 50 / result["reranker_pairs_per_second"] * 1000
+        lines.append(
+            f"- 重排模型实际吞吐 {result['reranker_pairs_per_second']} 对/秒，"
+            f"即 50 个候选约 {per_question:.0f} ms/题（不含缓存）"
+        )
+    return "\n".join(lines) + "\n"
+
+
 def _pct(value: float | None) -> str:
     return "—" if value is None else f"{value * 100:.1f}%"
 
@@ -112,7 +260,7 @@ def render_sweep(result: dict[str, Any]) -> str:
     lines = [
         "# 朴素 RAG 检索召回（不调用 LLM）",
         "",
-        f"向量模型 `{result['embedding_model'].replace(chr(92), '/').rsplit('/', 1)[-1]}` · 题型 "
+        f"向量模型 `{_short(result['embedding_model'])}` · 题型 "
         f"{','.join(map(str, result['categories']))} · 共 {result['questions']} 题 · 证据 {result['evidence_ids']} 条，"
         f"其中 {result['evidence_ids_missing']} 条在对话里找不到（标注噪声，召回上限因此低于 100%）",
         "",

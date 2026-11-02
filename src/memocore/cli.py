@@ -54,8 +54,15 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--max-conversations", type=int)
     run.add_argument("--max-questions", type=int, help="每段对话按固定种子抽多少题")
     run.add_argument("--seed", type=int, default=0)
-    run.add_argument("--top-k", type=int, default=20, help="naive_rag 检索的块数")
+    run.add_argument("--top-k", type=int, default=20, help="检索类系统放进上下文的块数（hybrid_rag 中为轮数预算）")
     run.add_argument("--chunk-turns", type=int, default=1, help="naive_rag 每块包含的对话轮数")
+    run.add_argument(
+        "--fusion", choices=("pool", "rrf"), default="pool", help="hybrid_rag 中 BM25 的用法：补充重排候选（pool）或排名融合（rrf）"
+    )
+    run.add_argument("--rerank-candidates", type=int, default=50, help="hybrid_rag 交给重排模型的候选数，0 关闭重排")
+    run.add_argument("--no-time-anchors", action="store_true", help="hybrid_rag 关闭写入时的时间锚定")
+    run.add_argument("--neighbors", type=int, default=0, help="hybrid_rag 每个命中额外带上前后几轮")
+    run.add_argument("--max-per-session", type=int, help="hybrid_rag 每个会话最多命中几次")
     run.add_argument("--judge", choices=(*JUDGE_KINDS, "both", "none"), default="both")
     run.add_argument("--workers", type=int, default=8)
     run.add_argument("--mock", action="store_true", help="离线占位模型，只检查流程，不调用 API")
@@ -81,6 +88,15 @@ def build_parser() -> argparse.ArgumentParser:
     sweep.add_argument("--top-k", type=_int_list, default=(1, 3, 5, 10, 20))
     sweep.add_argument("--chunk-turns", type=_int_list, default=(1, 2, 4))
     sweep.add_argument("--categories", type=_int_list, default=DEFAULT_CATEGORIES)
+
+    compare = sub.add_parser("compare", help="两个运行按题配对比较，给出差值的置信区间和 p 值")
+    compare.add_argument("--baseline", required=True)
+    compare.add_argument("--candidate", required=True)
+    compare.add_argument("--metric", default="judge_strict", help="judge_strict / judge_lenient / f1")
+
+    ablation = sub.add_parser("retrieval-ablation", help="同一预算下逐个组件比较读取路径的证据召回，不调用 LLM")
+    ablation.add_argument("--budgets", type=_int_list, default=(5, 10, 20))
+    ablation.add_argument("--categories", type=_int_list, default=DEFAULT_CATEGORIES)
     return parser
 
 
@@ -129,6 +145,11 @@ def _dispatch(args: argparse.Namespace, settings: Settings) -> int:
             seed=args.seed,
             top_k=args.top_k,
             chunk_turns=args.chunk_turns,
+            fusion=args.fusion,
+            rerank_candidates=args.rerank_candidates,
+            neighbors=args.neighbors,
+            max_per_session=args.max_per_session,
+            time_anchors=not args.no_time_anchors,
             mock=args.mock,
         )
         run_predictions(cfg, settings, workers=args.workers)
@@ -153,6 +174,14 @@ def _dispatch(args: argparse.Namespace, settings: Settings) -> int:
             settings, top_ks=args.top_k, chunk_turns=args.chunk_turns, categories=args.categories
         )
         print(render_sweep(result))
+    elif args.command == "compare":
+        from memocore.compare import compare_runs, render_comparison
+
+        print(render_comparison(compare_runs(settings, args.baseline, args.candidate, args.metric)))
+    elif args.command == "retrieval-ablation":
+        from memocore.retrieval_eval import render_ablation, retrieval_ablation
+
+        print(render_ablation(retrieval_ablation(settings, budgets=args.budgets, categories=args.categories)))
     return 0
 
 

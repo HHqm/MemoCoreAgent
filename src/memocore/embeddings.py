@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import re
-import sqlite3
 from pathlib import Path
 from typing import Protocol, Sequence
 
 import numpy as np
+
+from memocore.kvcache import BlobCache
 
 _TOKEN = re.compile(r"[a-z0-9]+")
 
@@ -57,10 +58,7 @@ class CachedEmbedder:
     def __init__(self, inner: Embedder, path: Path):
         self.inner = inner
         self.name = inner.name
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(path))
-        self._conn.execute("CREATE TABLE IF NOT EXISTS vectors (key TEXT PRIMARY KEY, vector BLOB NOT NULL)")
-        self._conn.commit()
+        self._store = BlobCache(path, "embeddings")
         self.hits = self.misses = 0
 
     def _key(self, text: str) -> str:
@@ -68,24 +66,14 @@ class CachedEmbedder:
 
     def encode(self, texts: Sequence[str]) -> np.ndarray:
         keys = [self._key(text) for text in texts]
-        found: dict[str, np.ndarray] = {}
-        for start in range(0, len(keys), 500):  # stay under SQLite's bound-parameter limit
-            batch = keys[start : start + 500]
-            rows = self._conn.execute(
-                f"SELECT key, vector FROM vectors WHERE key IN ({','.join('?' * len(batch))})", batch
-            ).fetchall()
-            found.update((key, np.frombuffer(blob, dtype=np.float32)) for key, blob in rows)
+        found = {key: np.frombuffer(blob, dtype=np.float32) for key, blob in self._store.get_many(keys).items()}
         missing = [i for i, key in enumerate(keys) if key not in found]
         self.hits += len(keys) - len(missing)
         self.misses += len(missing)
         if missing:
-            fresh = self.inner.encode([texts[i] for i in missing])
-            self._conn.executemany(
-                "INSERT OR REPLACE INTO vectors (key, vector) VALUES (?, ?)",
-                [(keys[i], vector.astype(np.float32).tobytes()) for i, vector in zip(missing, fresh)],
-            )
-            self._conn.commit()
-            found.update((keys[i], vector.astype(np.float32)) for i, vector in zip(missing, fresh))
+            fresh = np.asarray(self.inner.encode([texts[i] for i in missing]), dtype=np.float32)
+            self._store.put_many((keys[i], vector.tobytes()) for i, vector in zip(missing, fresh))
+            found.update((keys[i], vector) for i, vector in zip(missing, fresh))
         if not keys:
             return np.zeros((0, 0), dtype=np.float32)
         return np.stack([found[key] for key in keys])

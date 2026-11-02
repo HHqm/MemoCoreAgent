@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from typing import Sequence
 
-from memocore.datasets.locomo import Conversation
+from memocore.datasets.locomo import Conversation, Session, Turn
 
 
 @dataclass(frozen=True)
@@ -27,3 +28,27 @@ class MemorySystem(ABC):
 
     @abstractmethod
     def retrieve(self, question: str) -> RetrievedContext: ...
+
+
+def render_turns(pairs: Sequence[tuple[Session, Turn]]) -> RetrievedContext:
+    """Context from (session, turn) pairs already in conversation order, one date header per run of a session."""
+    blocks: list[tuple[Session, list[Turn]]] = []
+    for session, turn in pairs:
+        if blocks and blocks[-1][0] is session:
+            blocks[-1][1].append(turn)
+        else:
+            blocks.append((session, [turn]))
+    text = "\n\n".join(session.render(turns) for session, turns in blocks)
+    return RetrievedContext(text, tuple(turn.dia_id for _, turn in pairs))
+
+
+class NoMemorySystem(MemorySystem):
+    """Gives the model no memory at all: the floor that shows how much guessing and common sense score."""
+
+    name = "no_memory"
+
+    def ingest(self, conversation: Conversation) -> None:
+        pass
+
+    def retrieve(self, question: str) -> RetrievedContext:
+        return RetrievedContext("(no memory available)", ())

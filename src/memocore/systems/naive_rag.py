@@ -6,7 +6,7 @@ import numpy as np
 
 from memocore.datasets.locomo import Conversation, Session, Turn
 from memocore.embeddings import Embedder
-from memocore.systems.base import MemorySystem, RetrievedContext
+from memocore.systems.base import MemorySystem, RetrievedContext, render_turns
 
 
 @dataclass(frozen=True)
@@ -61,16 +61,6 @@ class NaiveRAGSystem(MemorySystem):
         scores = self._matrix @ self._embedder.encode([question])[0]
         k = min(self.top_k, len(self._chunks))
         top = np.argpartition(-scores, k - 1)[:k]
-        # Present hits in conversation order rather than score order, so the timeline reads naturally,
-        # and give each session's date once rather than once per chunk.
+        # Present hits in conversation order rather than score order, so the timeline reads naturally.
         ordered = sorted(int(i) for i in top)
-        blocks: list[tuple[Session, list[Turn]]] = []
-        for i in ordered:
-            chunk = self._chunks[i]
-            if blocks and blocks[-1][0] is chunk.session:
-                blocks[-1][1].extend(chunk.turns)
-            else:
-                blocks.append((chunk.session, list(chunk.turns)))
-        text = "\n\n".join(session.render(turns) for session, turns in blocks)
-        turn_ids = tuple(turn.dia_id for _, turns in blocks for turn in turns)
-        return RetrievedContext(text, turn_ids)
+        return render_turns([(self._chunks[i].session, turn) for i in ordered for turn in self._chunks[i].turns])

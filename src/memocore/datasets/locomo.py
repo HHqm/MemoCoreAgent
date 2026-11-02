@@ -25,11 +25,15 @@ class Turn:
     speaker: str
     text: str
     image_caption: str | None = None
+    # Derived at write time (see memocore.temporal); the raw text above is never rewritten.
+    time_note: str | None = None
 
     def render(self) -> str:
         line = f"{self.speaker}: {self.text}"
         if self.image_caption:
             line += f" [shares an image: {self.image_caption}]"
+        if self.time_note:
+            line += f" [{self.time_note}]"
         return line
 
 

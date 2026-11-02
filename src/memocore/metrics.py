@@ -65,6 +65,23 @@ def locomo_f1(prediction: str, gold: str, category: int) -> float:
     return token_f1(prediction, gold)
 
 
+def answer_visible(gold: str, context: str, category: int) -> bool | None:
+    """Whether every word of the gold answer appears somewhere in the context.
+
+    A cheap, LLM-free proxy for "could a model read the answer off this context". It is how
+    write-time time anchoring is measured: "yesterday" in a turn never contains "7 May 2023",
+    the anchored note does.
+    """
+    if category == 5:
+        return None
+    if category == 3:
+        gold = gold.split(";")[0]
+    needed = set(normalize_answer(gold).split())
+    if not needed:
+        return None
+    return needed <= set(normalize_answer(context).split())
+
+
 def evidence_recall(evidence: Sequence[str], context_ids: Sequence[str]) -> float | None:
     """Share of gold evidence turns present in the context: separates retrieval misses from reasoning misses."""
     if not evidence:
