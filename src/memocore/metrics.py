@@ -88,3 +88,18 @@ def evidence_recall(evidence: Sequence[str], context_ids: Sequence[str]) -> floa
         return None
     context = set(context_ids)
     return sum(turn_id in context for turn_id in evidence) / len(evidence)
+
+
+def citation_scores(cited: Sequence[str], evidence: Sequence[str], context_ids: Sequence[str]) -> dict:
+    """How well an answer's cited turns match the annotated evidence, and whether they were in its context.
+
+    LoCoMo's evidence lists are sometimes incomplete, so precision here is a lower bound.
+    """
+    cited_set, gold = set(cited), set(evidence)
+    hits = len(cited_set & gold)
+    return {
+        "cited_ids": list(cited),
+        "citation_precision": hits / len(cited_set) if cited_set and gold else None,
+        "citation_recall": hits / len(gold) if gold else None,
+        "citation_in_context": len(cited_set & set(context_ids)) / len(cited_set) if cited_set else None,
+    }

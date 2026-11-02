@@ -80,6 +80,16 @@ class HybridSystemTest(unittest.TestCase):
         self.assertTrue(head <= set(ranked[:4]))
         self.assertEqual(sorted(ranked), list(range(len(self.conversation.turn_ids))))  # nothing lost or duplicated
 
+    def test_feedback_hop_adds_reranked_candidates_without_losing_turns(self):
+        question = ["Who is learning the violin?"]
+        plain = self._system(use_bm25=False, rerank_candidates=2).rank(question)[0]
+        system = self._system(use_bm25=False, rerank_candidates=2, feedback_turns=1, feedback_candidates=2)
+        ranked = system.rank(question)[0]
+        self.assertEqual(ranked[0], plain[0])  # the best hit is reranked against the question either way
+        self.assertEqual(sorted(ranked), list(range(len(self.conversation.turn_ids))))  # nothing lost or duplicated
+        with self.assertRaises(ValueError):
+            HybridRAGSystem(HashingEmbedder(), options=HybridOptions(feedback_turns=2))
+
     def test_time_anchors_reach_the_context(self):
         system = self._system(time_anchors=True)
         context = system.retrieve("When did Alice adopt Max?")

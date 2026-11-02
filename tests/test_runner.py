@@ -43,6 +43,24 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(violin["context_turns"], 2)
         self.assertIsNotNone(violin["evidence_recall"])
 
+    def test_citing_prompt_strips_and_scores_citations(self):
+        def responder(messages):
+            # The citing prompt must show turn ids in the context, or the model has nothing to cite.
+            return "The violin [D1:2]" if "[D1:2] Bob:" in messages[-1]["content"] else "no ids"
+
+        cfg = RunConfig(system="full_context", run_name="cite", prompt="v3", mock=True)
+        rows = {row["qa_id"]: row for row in read_jsonl(self._run(cfg=cfg, chat=MockChat(responder=responder)))}
+        violin = rows["conv-test#q0001"]
+        self.assertEqual(violin["prediction"], "The violin")
+        self.assertEqual(violin["raw_prediction"], "The violin [D1:2]")
+        self.assertEqual(violin["cited_ids"], ["D1:2"])
+        self.assertEqual((violin["citation_precision"], violin["citation_in_context"]), (1.0, 1.0))
+        uncited = [row for row in rows.values() if not row["cited_ids"]]
+        self.assertEqual({row["sample_id"] for row in uncited}, {"conv-two"})  # its context has no D1:2
+        self.assertIsNone(uncited[0]["citation_precision"])
+        cited = summarize("cite", self.settings)["groups"]["overall"]["cited"]
+        self.assertAlmostEqual(cited, 1 - len(uncited) / len(rows))
+
     def test_resume_skips_answered_questions(self):
         self._run()
         second = MockChat()
@@ -66,6 +84,10 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(len(first), 4)  # 3 from conv-test + the single question of conv-two
         with self.assertRaises(ValueError):
             select_questions(samples, RunConfig(system="full_context", run_name="x", conversations=("conv-missing",)))
+        picked = select_questions(samples, RunConfig(system="full_context", run_name="x", qa_ids=(first[0],), max_questions=3))
+        self.assertEqual([qa.qa_id for _, qs in picked for qa in qs], [first[0]])
+        with self.assertRaises(ValueError):
+            select_questions(samples, RunConfig(system="full_context", run_name="x", qa_ids=("conv-test#q9999",)))
 
     def test_judge_summary_and_audit(self):
         self._run()

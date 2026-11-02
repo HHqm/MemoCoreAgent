@@ -19,18 +19,23 @@ def build_system(
     top_k: int = 20,
     chunk_turns: int = 1,
     hybrid: HybridOptions | None = None,
+    cite: bool = False,
 ) -> MemorySystem:
+    system: MemorySystem
     if name == "no_memory":
-        return NoMemorySystem()
-    if name == "full_context":
-        return FullContextSystem()
-    if name == "naive_rag":
+        system = NoMemorySystem()
+    elif name == "full_context":
+        system = FullContextSystem()
+    elif name == "naive_rag":
         if embedder is None:
             raise ValueError("naive_rag needs an embedder")
-        return NaiveRAGSystem(embedder, top_k=top_k, chunk_turns=chunk_turns)
-    if name == "hybrid_rag":
-        return HybridRAGSystem(embedder, reranker, top_k=top_k, options=hybrid or HybridOptions())
-    raise ValueError(f"unknown system {name!r}; choose from {', '.join(SYSTEM_NAMES)}")
+        system = NaiveRAGSystem(embedder, top_k=top_k, chunk_turns=chunk_turns)
+    elif name == "hybrid_rag":
+        system = HybridRAGSystem(embedder, reranker, top_k=top_k, options=hybrid or HybridOptions())
+    else:
+        raise ValueError(f"unknown system {name!r}; choose from {', '.join(SYSTEM_NAMES)}")
+    system.cite = cite
+    return system
 
 
 __all__ = [

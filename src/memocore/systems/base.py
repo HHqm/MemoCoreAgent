@@ -22,6 +22,8 @@ class MemorySystem(ABC):
     """
 
     name: str
+    # Prefix each context line with its turn id, so the answer can cite where it came from.
+    cite: bool = False
 
     @abstractmethod
     def ingest(self, conversation: Conversation) -> None: ...
@@ -30,7 +32,7 @@ class MemorySystem(ABC):
     def retrieve(self, question: str) -> RetrievedContext: ...
 
 
-def render_turns(pairs: Sequence[tuple[Session, Turn]]) -> RetrievedContext:
+def render_turns(pairs: Sequence[tuple[Session, Turn]], with_ids: bool = False) -> RetrievedContext:
     """Context from (session, turn) pairs already in conversation order, one date header per run of a session."""
     blocks: list[tuple[Session, list[Turn]]] = []
     for session, turn in pairs:
@@ -38,7 +40,7 @@ def render_turns(pairs: Sequence[tuple[Session, Turn]]) -> RetrievedContext:
             blocks[-1][1].append(turn)
         else:
             blocks.append((session, [turn]))
-    text = "\n\n".join(session.render(turns) for session, turns in blocks)
+    text = "\n\n".join(session.render(turns, with_ids) for session, turns in blocks)
     return RetrievedContext(text, tuple(turn.dia_id for _, turn in pairs))
 
 

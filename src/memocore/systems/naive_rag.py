@@ -63,4 +63,4 @@ class NaiveRAGSystem(MemorySystem):
         top = np.argpartition(-scores, k - 1)[:k]
         # Present hits in conversation order rather than score order, so the timeline reads naturally.
         ordered = sorted(int(i) for i in top)
-        return render_turns([(self._chunks[i].session, turn) for i in ordered for turn in self._chunks[i].turns])
+        return render_turns([(self._chunks[i].session, turn) for i in ordered for turn in self._chunks[i].turns], self.cite)

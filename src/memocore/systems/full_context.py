@@ -13,7 +13,7 @@ class FullContextSystem(MemorySystem):
         self._context = RetrievedContext("", ())
 
     def ingest(self, conversation: Conversation) -> None:
-        self._context = RetrievedContext(conversation.render(), conversation.turn_ids)
+        self._context = RetrievedContext(conversation.render(self.cite), conversation.turn_ids)
 
     def retrieve(self, question: str) -> RetrievedContext:
         return self._context

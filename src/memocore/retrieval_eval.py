@@ -122,6 +122,9 @@ ABLATION_CONFIGS: dict[str, HybridOptions] = {
     "dense+bm25(pool)+rerank50": HybridOptions(fusion="pool", rerank_candidates=50),
     "dense+rerank50+time": HybridOptions(use_bm25=False, rerank_candidates=50, time_anchors=True),
     "dense+bm25(pool)+rerank50+time": HybridOptions(fusion="pool", rerank_candidates=50, time_anchors=True),
+    "dense+bm25(pool)+rerank50+time+feedback": HybridOptions(
+        fusion="pool", rerank_candidates=50, time_anchors=True, feedback_turns=2
+    ),
 }
 
 

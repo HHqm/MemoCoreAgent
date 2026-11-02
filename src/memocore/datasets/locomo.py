@@ -28,8 +28,8 @@ class Turn:
     # Derived at write time (see memocore.temporal); the raw text above is never rewritten.
     time_note: str | None = None
 
-    def render(self) -> str:
-        line = f"{self.speaker}: {self.text}"
+    def render(self, with_id: bool = False) -> str:
+        line = f"[{self.dia_id}] {self.speaker}: {self.text}" if with_id else f"{self.speaker}: {self.text}"
         if self.image_caption:
             line += f" [shares an image: {self.image_caption}]"
         if self.time_note:
@@ -43,8 +43,8 @@ class Session:
     date_time: str
     turns: tuple[Turn, ...]
 
-    def render(self, turns: Sequence[Turn] | None = None) -> str:
-        body = "\n".join(turn.render() for turn in (self.turns if turns is None else turns))
+    def render(self, turns: Sequence[Turn] | None = None, with_ids: bool = False) -> str:
+        body = "\n".join(turn.render(with_ids) for turn in (self.turns if turns is None else turns))
         return f"--- Conversation at {self.date_time} ---\n{body}"
 
 
@@ -59,8 +59,8 @@ class Conversation:
     def turn_ids(self) -> tuple[str, ...]:
         return tuple(turn.dia_id for session in self.sessions for turn in session.turns)
 
-    def render(self) -> str:
-        return "\n\n".join(session.render() for session in self.sessions)
+    def render(self, with_ids: bool = False) -> str:
+        return "\n\n".join(session.render(with_ids=with_ids) for session in self.sessions)
 
 
 @dataclass(frozen=True)

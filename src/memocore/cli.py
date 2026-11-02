@@ -8,6 +8,7 @@ from pathlib import Path
 from memocore.config import Settings
 from memocore.datasets.locomo import CATEGORY_NAMES, DEFAULT_CATEGORIES, LOCOMO_URL, load_locomo
 from memocore.judge import JUDGE_KINDS
+from memocore.prompts import ANSWER_TEMPLATES, DEFAULT_PROMPT
 from memocore.runner import (
     SUMMARY_MD,
     RunConfig,
@@ -53,6 +54,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--conversations", type=_str_list, default=(), help="只跑这些对话，如 conv-26,conv-30")
     run.add_argument("--max-conversations", type=int)
     run.add_argument("--max-questions", type=int, help="每段对话按固定种子抽多少题")
+    run.add_argument("--prompt", choices=tuple(ANSWER_TEMPLATES), default=DEFAULT_PROMPT, help="回答 prompt 版本，用于 A/B")
+    run.add_argument("--qa-ids", type=_str_list, default=(), help="只跑这些题，如 conv-26#q0019，用于抽查（忽略 --max-questions）")
     run.add_argument("--seed", type=int, default=0)
     run.add_argument("--top-k", type=int, default=20, help="检索类系统放进上下文的块数（hybrid_rag 中为轮数预算）")
     run.add_argument("--chunk-turns", type=int, default=1, help="naive_rag 每块包含的对话轮数")
@@ -61,6 +64,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--rerank-candidates", type=int, default=50, help="hybrid_rag 交给重排模型的候选数，0 关闭重排")
     run.add_argument("--no-time-anchors", action="store_true", help="hybrid_rag 关闭写入时的时间锚定")
+    run.add_argument("--feedback-turns", type=int, default=2, help="hybrid_rag 伪相关反馈取前几轮做第二跳，0 关闭")
     run.add_argument("--neighbors", type=int, default=0, help="hybrid_rag 每个命中额外带上前后几轮")
     run.add_argument("--max-per-session", type=int, help="hybrid_rag 每个会话最多命中几次")
     run.add_argument(
@@ -143,6 +147,8 @@ def _dispatch(args: argparse.Namespace, settings: Settings) -> int:
             categories=args.categories,
             conversations=args.conversations,
             max_conversations=args.max_conversations,
+            qa_ids=args.qa_ids,
+            prompt=args.prompt,
             max_questions=args.max_questions,
             seed=args.seed,
             top_k=args.top_k,
@@ -152,6 +158,7 @@ def _dispatch(args: argparse.Namespace, settings: Settings) -> int:
             neighbors=args.neighbors,
             max_per_session=args.max_per_session,
             time_anchors=not args.no_time_anchors,
+            feedback_turns=args.feedback_turns,
             mock=args.mock,
         )
         run_predictions(cfg, settings, workers=args.workers)

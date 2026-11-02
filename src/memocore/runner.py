@@ -34,8 +34,15 @@ from memocore.judge import (
     rule_verdict,
 )
 from memocore.llm import ChatModel, Message, MockChat, OpenAICompatibleChat, ResponseCache
-from memocore.metrics import answer_visible, evidence_recall, locomo_f1
-from memocore.prompts import ANSWER_MAX_TOKENS, PROMPT_VERSION, answer_messages
+from memocore.metrics import answer_visible, citation_scores, evidence_recall, locomo_f1
+from memocore.prompts import (
+    ANSWER_MAX_TOKENS,
+    CITING_PROMPTS,
+    DEFAULT_PROMPT,
+    answer_messages,
+    prompt_version,
+    split_citations,
+)
 from memocore.retrieval.rerank import CrossEncoderReranker, LexicalReranker, Reranker
 from memocore.stats import bootstrap_ci
 from memocore.systems import NEEDS_EMBEDDER, HybridOptions, RetrievedContext, build_system
@@ -62,6 +69,7 @@ class RunConfig:
     max_conversations: int | None = None
     max_questions: int | None = None  # per conversation, drawn with a fixed seed
     seed: int = 0
+    qa_ids: tuple[str, ...] = ()  # spot checks: only these questions, ignoring max_questions
     # Chosen from `memocore retrieval-sweep`: at a fixed context budget, one-turn chunks recall the
     # most evidence, and 20 of them (about 3% of a conversation) recall 76% of it with bge-m3.
     top_k: int = 20
@@ -72,6 +80,9 @@ class RunConfig:
     neighbors: int = 0
     max_per_session: int | None = None
     time_anchors: bool = True
+    # Chosen with `memocore retrieval-ablation`: +1.2 points evidence recall at 20 turns, +4.2 on multi-hop.
+    feedback_turns: int = 2
+    prompt: str = DEFAULT_PROMPT
     mock: bool = False
 
     @property
@@ -82,6 +93,7 @@ class RunConfig:
             neighbors=self.neighbors,
             max_per_session=self.max_per_session,
             time_anchors=self.time_anchors,
+            feedback_turns=self.feedback_turns,
         )
 
 
@@ -121,11 +133,16 @@ def select_questions(samples: list[LocomoSample], cfg: RunConfig) -> list[tuple[
     selected = []
     for sample in samples:
         questions = [qa for qa in sample.qa if qa.category in cfg.categories]
-        if cfg.max_questions is not None and len(questions) > cfg.max_questions:
+        if cfg.qa_ids:
+            questions = [qa for qa in questions if qa.qa_id in cfg.qa_ids]
+        elif cfg.max_questions is not None and len(questions) > cfg.max_questions:
             # A seeded draw rather than the first N: LoCoMo lists its questions roughly grouped by type.
             rng = random.Random(f"{cfg.seed}:{sample.conversation.sample_id}")
             questions = sorted(rng.sample(questions, cfg.max_questions), key=lambda qa: qa.index)
         selected.append((sample, questions))
+    missing = set(cfg.qa_ids) - {qa.qa_id for _, questions in selected for qa in questions}
+    if missing:
+        raise ValueError(f"unknown question ids (or outside --categories): {', '.join(sorted(missing))}")
     return selected
 
 
@@ -176,6 +193,7 @@ def run_predictions(
                 top_k=cfg.top_k,
                 chunk_turns=cfg.chunk_turns,
                 hybrid=cfg.hybrid,
+                cite=cfg.prompt in CITING_PROMPTS,
             )
             start = time.perf_counter()
             system.ingest(conversation)
@@ -195,11 +213,11 @@ def run_predictions(
                 jobs.append((qa, context, time.perf_counter() - start))
             # Answer one question alone first: with a shared prompt prefix (full_context) this lets the
             # provider build its prefix cache before the rest arrive in parallel and would all miss it.
-            predictions.write(_answer_one(chat, conversation, *jobs[0]))
+            predictions.write(_answer_one(chat, conversation, cfg.prompt, *jobs[0]))
             bar.update(1)
             with ThreadPoolExecutor(max_workers=workers) as pool:
                 futures = [
-                    pool.submit(_answer_one, chat, conversation, qa, context, retrieve_s)
+                    pool.submit(_answer_one, chat, conversation, cfg.prompt, qa, context, retrieve_s)
                     for qa, context, retrieve_s in jobs[1:]
                 ]
                 for future in as_completed(futures):
@@ -216,7 +234,7 @@ def _identity(
     return {
         "system": cfg.system,
         "answer_model": chat.model,
-        "prompt_version": PROMPT_VERSION,
+        "prompt_version": prompt_version(cfg.prompt),
         "mock": cfg.mock,
         "top_k": cfg.top_k if retrieval else None,
         "chunk_turns": cfg.chunk_turns if cfg.system == "naive_rag" else None,
@@ -226,6 +244,7 @@ def _identity(
         "neighbors": cfg.neighbors if hybrid else None,
         "max_per_session": cfg.max_per_session if hybrid else None,
         "time_anchors": cfg.time_anchors if hybrid else None,
+        "feedback_turns": cfg.feedback_turns if hybrid else None,
         "reranker_model": reranker.name if reranker else None,
     }
 
@@ -242,20 +261,30 @@ def _check_identity(run_dir: Path, identity: dict[str, Any]) -> None:
 
 
 def _answer_one(
-    chat: ChatModel, conversation: Conversation, qa: QAItem, context: RetrievedContext, retrieve_s: float
+    chat: ChatModel,
+    conversation: Conversation,
+    prompt: str,
+    qa: QAItem,
+    context: RetrievedContext,
+    retrieve_s: float,
 ) -> dict[str, Any]:
-    completion = chat.complete(
-        answer_messages(conversation, context.text, qa.question), max_tokens=ANSWER_MAX_TOKENS, temperature=0.0
-    )
-    return {
+    messages = answer_messages(conversation, context.text, qa.question, prompt)
+    completion = chat.complete(messages, max_tokens=ANSWER_MAX_TOKENS, temperature=0.0)
+    if completion.finish_reason == "length":
+        # The thinking model occasionally spends the whole cap on reasoning and returns nothing; one larger retry.
+        completion = chat.complete(messages, max_tokens=ANSWER_MAX_TOKENS * 2, temperature=0.0)
+    answer, cited = completion.text, None
+    if prompt in CITING_PROMPTS:
+        answer, cited = split_citations(completion.text)
+    row = {
         "qa_id": qa.qa_id,
         "sample_id": qa.sample_id,
         "category": qa.category,
         "category_name": qa.category_name,
         "question": qa.question,
         "gold": qa.gold,
-        "prediction": completion.text,
-        "f1": locomo_f1(completion.text, qa.gold, qa.category),
+        "prediction": answer,
+        "f1": locomo_f1(answer, qa.gold, qa.category),
         "evidence": list(qa.evidence),
         "evidence_recall": evidence_recall(qa.evidence, context.turn_ids),
         "answer_visible": answer_visible(qa.gold, context.text, qa.category),
@@ -269,6 +298,10 @@ def _answer_one(
         "from_cache": completion.from_cache,
         "finish_reason": completion.finish_reason,
     }
+    if cited is not None:
+        row["raw_prediction"] = completion.text
+        row.update(citation_scores(cited, qa.evidence, context.turn_ids))
+    return row
 
 
 def run_judge(
@@ -389,6 +422,10 @@ def _group_stats(rows: list[dict[str, Any]], verdicts: dict[str, dict[str, dict[
     stats["answer_visible"] = _mean(
         float(row["answer_visible"]) for row in rows if row.get("answer_visible") is not None
     )
+    if any("cited_ids" in row for row in rows):
+        stats["cited"] = _mean(float(bool(row.get("cited_ids"))) for row in rows)
+        for key in ("citation_precision", "citation_recall", "citation_in_context"):
+            stats[key] = _mean(row[key] for row in rows if row.get(key) is not None)
     stats["truncated"] = sum(row.get("finish_reason") == "length" for row in rows)
     stats["context_turns"] = _mean(row["context_turns"] for row in rows)
     stats["prompt_tokens"] = _mean(row["prompt_tokens"] for row in rows)
@@ -424,7 +461,8 @@ def render_markdown(summary: dict[str, Any]) -> str:
         meta.append(
             f"预算 {info['top_k']} 轮，BM25 {info.get('fusion')}，重排候选 {info['rerank_candidates']}（`{reranker}`），"
             f"邻近 ±{info['neighbors']} 轮，每会话上限 {info['max_per_session'] or '不限'}，"
-            f"时间锚定 {'开' if info.get('time_anchors') else '关'}"
+            f"时间锚定 {'开' if info.get('time_anchors') else '关'}，"
+            f"伪相关反馈 {info.get('feedback_turns') or '关'}"
         )
     lines = [f"# 评测结果：{summary['run']}", "", " · ".join(meta), ""]
     if info.get("mock"):
@@ -460,6 +498,13 @@ def render_markdown(summary: dict[str, Any]) -> str:
             complete = stats.get("judge_strict_wrong_with_evidence", 0)
             wrong = round(stats["judge_strict_n"] * (1 - (stats.get("judge_strict") or 0)))
             lines.append(f"| {name} | {wrong} | {missing} | {complete} |")
+    if "cited" in overall:
+        lines += [
+            "",
+            f"出处引用（对照 LoCoMo 标注证据，标注不全时精确率偏低）：带引用的回答 {_pct(overall['cited'])}，"
+            f"引用精确率 {_pct(overall.get('citation_precision'))}，标注证据被引用 {_pct(overall.get('citation_recall'))}，"
+            f"引用落在上下文内 {_pct(overall.get('citation_in_context'))}",
+        ]
     lines += ["", "Token 合计（prompt / 其中命中前缀缓存 / completion）：", ""]
     for stage, totals in summary["tokens"].items():
         lines.append(
