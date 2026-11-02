@@ -1,0 +1,410 @@
+"""Run a memory system over LoCoMo, grade its answers and summarise the scores.
+
+Every stage appends to JSONL and skips work already on disk, and every LLM call goes through the
+response cache, so an interrupted run resumes where it stopped without paying twice.
+"""
+
+from __future__ import annotations
+
+import csv
+import json
+import random
+import time
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from pathlib import Path
+from statistics import fmean
+from typing import Any, Iterable
+
+import numpy as np
+from tqdm import tqdm
+
+from memocore.config import Settings
+from memocore.datasets.locomo import CATEGORY_NAMES, DEFAULT_CATEGORIES, Conversation, LocomoSample, QAItem, load_locomo
+from memocore.embeddings import CachedEmbedder, Embedder, HashingEmbedder, SentenceTransformerEmbedder
+from memocore.jsonl import JsonlWriter, read_jsonl
+from memocore.judge import JUDGE_KINDS, JUDGE_MAX_TOKENS, judge_messages, mock_judge_responder, parse_verdict
+from memocore.llm import ChatModel, Message, MockChat, OpenAICompatibleChat, ResponseCache
+from memocore.metrics import evidence_recall, locomo_f1
+from memocore.prompts import ANSWER_MAX_TOKENS, PROMPT_VERSION, answer_messages
+from memocore.systems import NEEDS_EMBEDDER, RetrievedContext, build_system
+
+PREDICTIONS = "predictions.jsonl"
+INGEST_LOG = "ingest.jsonl"
+RUN_INFO = "run.json"
+SUMMARY_JSON = "summary.json"
+SUMMARY_MD = "summary.md"
+# Full-context runs would otherwise store every turn id of the conversation for every question.
+MAX_STORED_IDS = 100
+
+
+class RunMismatchError(RuntimeError):
+    """Resuming a run with settings that would make its rows incomparable."""
+
+
+@dataclass(frozen=True)
+class RunConfig:
+    system: str
+    run_name: str
+    categories: tuple[int, ...] = DEFAULT_CATEGORIES
+    conversations: tuple[str, ...] = ()
+    max_conversations: int | None = None
+    max_questions: int | None = None  # per conversation, drawn with a fixed seed
+    seed: int = 0
+    # Chosen from `memocore retrieval-sweep`: at a fixed context budget, one-turn chunks recall the
+    # most evidence, and 20 of them (about 3% of a conversation) recall 76% of it with bge-m3.
+    top_k: int = 20
+    chunk_turns: int = 1
+    mock: bool = False
+
+
+def judge_path(run_dir: Path, kind: str) -> Path:
+    return run_dir / f"judge_{kind}.jsonl"
+
+
+def build_embedder(settings: Settings) -> Embedder:
+    inner = SentenceTransformerEmbedder(settings.embedding_model, device=settings.embedding_device)
+    return CachedEmbedder(inner, settings.embedding_cache_path)
+
+
+def build_chat(
+    settings: Settings, model: str, *, mock: bool, responder=None
+) -> ChatModel:
+    if mock:
+        return MockChat(responder=responder)
+    return OpenAICompatibleChat(
+        model, api_key=settings.api_key, base_url=settings.base_url, cache=ResponseCache(settings.cache_path)
+    )
+
+
+def select_questions(samples: list[LocomoSample], cfg: RunConfig) -> list[tuple[LocomoSample, list[QAItem]]]:
+    if cfg.conversations:
+        unknown = sorted(set(cfg.conversations) - {s.conversation.sample_id for s in samples})
+        if unknown:
+            raise ValueError(f"unknown conversation ids: {', '.join(unknown)}")
+        samples = [s for s in samples if s.conversation.sample_id in cfg.conversations]
+    if cfg.max_conversations is not None:
+        samples = samples[: cfg.max_conversations]
+    selected = []
+    for sample in samples:
+        questions = [qa for qa in sample.qa if qa.category in cfg.categories]
+        if cfg.max_questions is not None and len(questions) > cfg.max_questions:
+            # A seeded draw rather than the first N: LoCoMo lists its questions roughly grouped by type.
+            rng = random.Random(f"{cfg.seed}:{sample.conversation.sample_id}")
+            questions = sorted(rng.sample(questions, cfg.max_questions), key=lambda qa: qa.index)
+        selected.append((sample, questions))
+    return selected
+
+
+def run_predictions(
+    cfg: RunConfig,
+    settings: Settings,
+    *,
+    chat: ChatModel | None = None,
+    embedder: Embedder | None = None,
+    workers: int = 8,
+    progress: bool = True,
+) -> Path:
+    chat = chat or build_chat(settings, settings.answer_model, mock=cfg.mock)
+    run_dir = settings.runs_dir / cfg.run_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+    if cfg.system not in NEEDS_EMBEDDER:
+        embedder = None
+    elif embedder is None:
+        embedder = HashingEmbedder() if cfg.mock else build_embedder(settings)
+    _check_identity(run_dir, _identity(cfg, chat, embedder))
+
+    selected = select_questions(load_locomo(settings.locomo_path), cfg)
+    pred_path = run_dir / PREDICTIONS
+    done = {row["qa_id"] for row in read_jsonl(pred_path)}
+    total = sum(qa.qa_id not in done for _, questions in selected for qa in questions)
+
+    with (
+        JsonlWriter(pred_path) as predictions,
+        JsonlWriter(run_dir / INGEST_LOG) as ingest_log,
+        tqdm(total=total, desc=f"answer[{cfg.system}]", disable=not progress) as bar,
+    ):
+        for sample, questions in selected:
+            todo = [qa for qa in questions if qa.qa_id not in done]
+            if not todo:
+                continue
+            conversation = sample.conversation
+            system = build_system(cfg.system, embedder=embedder, top_k=cfg.top_k, chunk_turns=cfg.chunk_turns)
+            start = time.perf_counter()
+            system.ingest(conversation)
+            ingest_log.write(
+                {
+                    "sample_id": conversation.sample_id,
+                    "system": cfg.system,
+                    "turns": len(conversation.turn_ids),
+                    "ingest_s": round(time.perf_counter() - start, 4),
+                }
+            )
+            # Retrieval runs serially (local models are not shared across threads); only LLM calls fan out.
+            jobs = []
+            for qa in todo:
+                start = time.perf_counter()
+                context = system.retrieve(qa.question)
+                jobs.append((qa, context, time.perf_counter() - start))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = [
+                    pool.submit(_answer_one, chat, conversation, qa, context, retrieve_s)
+                    for qa, context, retrieve_s in jobs
+                ]
+                for future in as_completed(futures):
+                    predictions.write(future.result())
+                    bar.update(1)
+    return pred_path
+
+
+def _identity(cfg: RunConfig, chat: ChatModel, embedder: Embedder | None) -> dict[str, Any]:
+    retrieval = cfg.system in NEEDS_EMBEDDER
+    return {
+        "system": cfg.system,
+        "answer_model": chat.model,
+        "prompt_version": PROMPT_VERSION,
+        "mock": cfg.mock,
+        "top_k": cfg.top_k if retrieval else None,
+        "chunk_turns": cfg.chunk_turns if retrieval else None,
+        "embedding_model": embedder.name if embedder else None,
+    }
+
+
+def _check_identity(run_dir: Path, identity: dict[str, Any]) -> None:
+    path = run_dir / RUN_INFO
+    if not path.exists():
+        path.write_text(json.dumps(identity, ensure_ascii=False, indent=2), encoding="utf-8")
+        return
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    diff = {key: {"stored": stored.get(key), "now": value} for key, value in identity.items() if stored.get(key) != value}
+    if diff:
+        raise RunMismatchError(f"运行 {run_dir.name!r} 是用不同设置创建的：{diff}。请换一个 --run-name。")
+
+
+def _answer_one(
+    chat: ChatModel, conversation: Conversation, qa: QAItem, context: RetrievedContext, retrieve_s: float
+) -> dict[str, Any]:
+    completion = chat.complete(
+        answer_messages(conversation, context.text, qa.question), max_tokens=ANSWER_MAX_TOKENS, temperature=0.0
+    )
+    return {
+        "qa_id": qa.qa_id,
+        "sample_id": qa.sample_id,
+        "category": qa.category,
+        "category_name": qa.category_name,
+        "question": qa.question,
+        "gold": qa.gold,
+        "prediction": completion.text,
+        "f1": locomo_f1(completion.text, qa.gold, qa.category),
+        "evidence": list(qa.evidence),
+        "evidence_recall": evidence_recall(qa.evidence, context.turn_ids),
+        "context_turns": len(context.turn_ids),
+        "retrieved_ids": list(context.turn_ids) if len(context.turn_ids) <= MAX_STORED_IDS else None,
+        "prompt_tokens": completion.usage.prompt_tokens,
+        "cached_prompt_tokens": completion.usage.cached_prompt_tokens,
+        "completion_tokens": completion.usage.completion_tokens,
+        "answer_latency_s": round(completion.latency_s, 4),
+        "retrieve_latency_s": round(retrieve_s, 4),
+        "from_cache": completion.from_cache,
+    }
+
+
+def run_judge(
+    run_name: str,
+    kind: str,
+    settings: Settings,
+    *,
+    chat: ChatModel | None = None,
+    workers: int = 8,
+    progress: bool = True,
+) -> Path:
+    if kind not in JUDGE_KINDS:
+        raise ValueError(f"unknown judge {kind!r}; choose from {', '.join(JUDGE_KINDS)}")
+    run_dir = _existing_run(settings, run_name)
+    info = json.loads((run_dir / RUN_INFO).read_text(encoding="utf-8"))
+    out = judge_path(run_dir, kind)
+    done = {row["qa_id"] for row in read_jsonl(out)}
+    todo = [row for row in read_jsonl(run_dir / PREDICTIONS) if row["qa_id"] not in done]
+    # A mock run is graded by the mock judge, so its placeholder answers never reach a paid API.
+    chat = chat or build_chat(settings, settings.judge_model, mock=info.get("mock", False), responder=mock_judge_responder)
+    with (
+        JsonlWriter(out) as writer,
+        ThreadPoolExecutor(max_workers=workers) as pool,
+        tqdm(total=len(todo), desc=f"judge[{kind}]", disable=not progress) as bar,
+    ):
+        futures = [pool.submit(_judge_one, chat, kind, row) for row in todo]
+        for future in as_completed(futures):
+            writer.write(future.result())
+            bar.update(1)
+    return out
+
+
+def _judge_one(chat: ChatModel, kind: str, prediction: dict[str, Any]) -> dict[str, Any]:
+    messages: list[Message] = judge_messages(kind, prediction["question"], prediction["gold"], prediction["prediction"])
+    completion = chat.complete(messages, max_tokens=JUDGE_MAX_TOKENS, temperature=0.0)
+    verdict = parse_verdict(completion.text)
+    return {
+        "qa_id": prediction["qa_id"],
+        "label": verdict.label,
+        "correct": verdict.correct,
+        "reasoning": verdict.reasoning,
+        "judge_model": chat.model,
+        "prompt_tokens": completion.usage.prompt_tokens,
+        "cached_prompt_tokens": completion.usage.cached_prompt_tokens,
+        "completion_tokens": completion.usage.completion_tokens,
+    }
+
+
+def summarize(run_name: str, settings: Settings) -> dict[str, Any]:
+    run_dir = _existing_run(settings, run_name)
+    info = json.loads((run_dir / RUN_INFO).read_text(encoding="utf-8"))
+    predictions = list(read_jsonl(run_dir / PREDICTIONS))
+    verdicts = {
+        kind: {row["qa_id"]: row for row in read_jsonl(judge_path(run_dir, kind))}
+        for kind in JUDGE_KINDS
+        if judge_path(run_dir, kind).exists()
+    }
+    groups: dict[str, list[dict[str, Any]]] = {"overall": predictions}
+    for category in sorted({row["category"] for row in predictions}):
+        groups[CATEGORY_NAMES.get(category, f"category-{category}")] = [
+            row for row in predictions if row["category"] == category
+        ]
+    summary = {
+        "run": run_name,
+        "info": info,
+        "groups": {name: _group_stats(rows, verdicts) for name, rows in groups.items()},
+        "tokens": {
+            "answer": _token_totals(predictions),
+            **{f"judge_{kind}": _token_totals(by_id.values()) for kind, by_id in verdicts.items()},
+        },
+    }
+    (run_dir / SUMMARY_JSON).write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    (run_dir / SUMMARY_MD).write_text(render_markdown(summary), encoding="utf-8")
+    return summary
+
+
+def _mean(values: Iterable[float]) -> float | None:
+    values = list(values)
+    return fmean(values) if values else None
+
+
+def _group_stats(rows: list[dict[str, Any]], verdicts: dict[str, dict[str, dict[str, Any]]]) -> dict[str, Any]:
+    stats: dict[str, Any] = {"n": len(rows), "f1": _mean(row["f1"] for row in rows)}
+    for kind, by_id in verdicts.items():
+        judged = [by_id[row["qa_id"]] for row in rows if row["qa_id"] in by_id]
+        stats[f"judge_{kind}"] = _mean(1.0 if verdict["correct"] else 0.0 for verdict in judged)
+        stats[f"judge_{kind}_n"] = len(judged)
+        stats[f"judge_{kind}_unparsed"] = sum(verdict["label"] is None for verdict in judged)
+    stats["evidence_recall"] = _mean(row["evidence_recall"] for row in rows if row["evidence_recall"] is not None)
+    stats["context_turns"] = _mean(row["context_turns"] for row in rows)
+    stats["prompt_tokens"] = _mean(row["prompt_tokens"] for row in rows)
+    latencies = [row["answer_latency_s"] for row in rows]
+    stats["latency_p50_s"] = float(np.percentile(latencies, 50)) if latencies else None
+    stats["latency_p95_s"] = float(np.percentile(latencies, 95)) if latencies else None
+    return stats
+
+
+def _token_totals(rows: Iterable[dict[str, Any]]) -> dict[str, int]:
+    totals = Counter()
+    for row in rows:
+        for key in ("prompt_tokens", "cached_prompt_tokens", "completion_tokens"):
+            totals[key] += row.get(key) or 0
+    return dict(totals)
+
+
+def _pct(value: float | None) -> str:
+    return "—" if value is None else f"{value * 100:.1f}%"
+
+
+def _num(value: float | None, digits: int = 0) -> str:
+    return "—" if value is None else f"{value:,.{digits}f}"
+
+
+def render_markdown(summary: dict[str, Any]) -> str:
+    info = summary["info"]
+    meta = [f"系统 `{info['system']}`", f"回答模型 `{info['answer_model']}`", f"Prompt `{info['prompt_version']}`"]
+    if info.get("top_k") is not None:
+        meta.append(f"top_k={info['top_k']}，每块 {info['chunk_turns']} 轮，向量模型 `{Path(info['embedding_model']).name}`")
+    lines = [f"# 评测结果：{summary['run']}", "", " · ".join(meta), ""]
+    if info.get("mock"):
+        lines += ["> **这是 --mock 离线运行：回答和裁判都是占位，数字只用来检查流程，没有任何意义。**", ""]
+    lines += [
+        "| 题型 | 题数 | F1 | 严格裁判 | 宽松裁判 | 证据召回 | 平均上下文轮数 | 平均 prompt token | 延迟 P50 / P95 (s) |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for name, stats in summary["groups"].items():
+        lines.append(
+            f"| {name} | {stats['n']} | {_pct(stats['f1'])} | {_pct(stats.get('judge_strict'))} | "
+            f"{_pct(stats.get('judge_lenient'))} | {_pct(stats['evidence_recall'])} | {_num(stats['context_turns'], 1)} | "
+            f"{_num(stats['prompt_tokens'])} | {_num(stats['latency_p50_s'], 2)} / {_num(stats['latency_p95_s'], 2)} |"
+        )
+    lines += ["", "Token 合计（prompt / 其中命中前缀缓存 / completion）：", ""]
+    for stage, totals in summary["tokens"].items():
+        lines.append(
+            f"- {stage}：{_num(totals.get('prompt_tokens', 0))} / {_num(totals.get('cached_prompt_tokens', 0))} / "
+            f"{_num(totals.get('completion_tokens', 0))}"
+        )
+    unparsed = {kind: summary["groups"]["overall"].get(f"judge_{kind}_unparsed", 0) for kind in JUDGE_KINDS}
+    if any(unparsed.values()):
+        lines += ["", f"裁判输出无法解析的条数（计为错误）：{unparsed}"]
+    return "\n".join(lines) + "\n"
+
+
+def _existing_run(settings: Settings, run_name: str) -> Path:
+    run_dir = settings.runs_dir / run_name
+    if not (run_dir / RUN_INFO).exists():
+        raise FileNotFoundError(f"找不到运行 {run_name!r}（{run_dir}），请先执行 memocore run。")
+    return run_dir
+
+
+AUDIT_FIELDS = ["qa_id", "category", "question", "gold", "prediction", "judge_label", "human_label"]
+_HUMAN_LABELS = {
+    "correct": "CORRECT", "c": "CORRECT", "1": "CORRECT", "y": "CORRECT", "yes": "CORRECT", "对": "CORRECT",
+    "wrong": "WRONG", "w": "WRONG", "0": "WRONG", "n": "WRONG", "no": "WRONG", "错": "WRONG",
+}
+
+
+def export_audit(run_name: str, kind: str, settings: Settings, *, n: int = 100, seed: int = 0) -> Path:
+    """Write a random sample of judged answers to CSV for a human to label in the human_label column."""
+    run_dir = _existing_run(settings, run_name)
+    verdicts = list(read_jsonl(judge_path(run_dir, kind)))
+    if not verdicts:
+        raise FileNotFoundError(f"运行 {run_name!r} 还没有 {kind} 裁判结果，请先执行 memocore judge。")
+    path = run_dir / f"audit_{kind}.csv"
+    if path.exists():
+        # Never overwrite a file that may already hold hand-written labels.
+        raise FileExistsError(f"{path} 已存在；如需重新抽样请先手动改名或删除。")
+    predictions = {row["qa_id"]: row for row in read_jsonl(run_dir / PREDICTIONS)}
+    chosen = random.Random(seed).sample(verdicts, min(n, len(verdicts)))
+    with path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=AUDIT_FIELDS)
+        writer.writeheader()
+        for verdict in chosen:
+            row = predictions[verdict["qa_id"]]
+            writer.writerow(
+                {
+                    "qa_id": row["qa_id"],
+                    "category": row["category_name"],
+                    "question": row["question"],
+                    "gold": row["gold"],
+                    "prediction": row["prediction"],
+                    "judge_label": verdict["label"] or "",
+                    "human_label": "",
+                }
+            )
+    return path
+
+
+def score_audit(csv_path: Path) -> dict[str, Any]:
+    with Path(csv_path).open(encoding="utf-8-sig", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    pairs = [(row["judge_label"], _HUMAN_LABELS.get(row["human_label"].strip().lower())) for row in rows]
+    labeled = [(judge, human) for judge, human in pairs if human]
+    agree = sum(judge == human for judge, human in labeled)
+    return {
+        "total": len(rows),
+        "labeled": len(labeled),
+        "agreement": agree / len(labeled) if labeled else None,
+        "confusion": dict(Counter(f"judge={judge or 'UNPARSED'} / human={human}" for judge, human in labeled)),
+    }

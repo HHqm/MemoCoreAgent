@@ -1,0 +1,51 @@
+[
+  {
+    "sample_id": "conv-test",
+    "conversation": {
+      "speaker_a": "Alice",
+      "speaker_b": "Bob",
+      "session_2_date_time": "10:00 am on 20 June, 2023",
+      "session_2": [
+        {"speaker": "Bob", "dia_id": "D2:1", "text": "I moved from Boston to Seattle last week."},
+        {"speaker": "Alice", "dia_id": "D2:2", "text": "Max loves the new park near my house."}
+      ],
+      "session_1_date_time": "1:00 pm on 8 May, 2023",
+      "session_1": [
+        {"speaker": "Alice", "dia_id": "D1:1", "text": "I adopted a golden retriever named Max yesterday."},
+        {"speaker": "Bob", "dia_id": "D1:2", "text": "Congrats! I just started learning the violin."},
+        {
+          "speaker": "Alice",
+          "dia_id": "D1:3",
+          "text": "Look at this painting I made.",
+          "img_url": ["https://example.invalid/painting.jpg"],
+          "blip_caption": "a painting of a sunset over a lake"
+        }
+      ]
+    },
+    "qa": [
+      {"question": "When did Alice adopt Max?", "answer": "7 May 2023", "evidence": ["D1:1"], "category": 2},
+      {"question": "What instrument is Bob learning?", "answer": "violin", "evidence": ["D1:2"], "category": 4},
+      {"question": "Where did Bob live before and after his move?", "answer": "Boston, Seattle", "evidence": ["D2:1"], "category": 1},
+      {"question": "Would Alice enjoy an art class?", "answer": "Likely yes; she paints", "evidence": ["D1:3"], "category": 3},
+      {"question": "What breed is Bob's dog?", "adversarial_answer": "golden retriever", "evidence": ["D1:1; D2:2"], "category": 5},
+      {"question": "What year did Alice paint?", "answer": 2023, "evidence": ["D1:3"], "category": 2}
+    ],
+    "event_summary": {},
+    "observation": {},
+    "session_summary": {}
+  },
+  {
+    "sample_id": "conv-two",
+    "conversation": {
+      "speaker_a": "Carol",
+      "speaker_b": "Dan",
+      "session_1_date_time": "9:00 am on 1 March, 2023",
+      "session_1": [
+        {"speaker": "Carol", "dia_id": "D1:1", "text": "I signed up for a pottery class."}
+      ]
+    },
+    "qa": [
+      {"question": "What class did Carol sign up for?", "answer": "pottery", "evidence": ["D1:1"], "category": 4}
+    ]
+  }
+]

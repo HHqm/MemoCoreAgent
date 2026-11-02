@@ -1,0 +1,160 @@
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+from memocore.config import Settings
+from memocore.datasets.locomo import CATEGORY_NAMES, DEFAULT_CATEGORIES, LOCOMO_URL, load_locomo
+from memocore.judge import JUDGE_KINDS
+from memocore.runner import (
+    SUMMARY_MD,
+    RunConfig,
+    RunMismatchError,
+    export_audit,
+    run_judge,
+    run_predictions,
+    score_audit,
+    summarize,
+)
+from memocore.systems import SYSTEM_NAMES
+
+
+def _int_list(text: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in text.split(",") if part.strip())
+
+
+def _str_list(text: str) -> tuple[str, ...]:
+    return tuple(part.strip() for part in text.split(",") if part.strip())
+
+
+def _judge_kinds(choice: str) -> tuple[str, ...]:
+    if choice == "none":
+        return ()
+    return JUDGE_KINDS if choice == "both" else (choice,)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="memocore", description="MemoCore：Agent 记忆系统的 LoCoMo 评测工具")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("download-locomo", help="下载 LoCoMo 数据集（locomo10.json）")
+
+    run = sub.add_parser("run", help="让一个记忆系统回答 LoCoMo 问题，然后裁判并汇总")
+    run.add_argument("--system", choices=SYSTEM_NAMES, required=True)
+    run.add_argument("--run-name", help="结果目录名，默认等于 --system；同名会续跑")
+    run.add_argument(
+        "--categories",
+        type=_int_list,
+        default=DEFAULT_CATEGORIES,
+        help="题型编号，逗号分隔：" + "，".join(f"{k}={v}" for k, v in CATEGORY_NAMES.items()) + "（默认 1,2,3,4）",
+    )
+    run.add_argument("--conversations", type=_str_list, default=(), help="只跑这些对话，如 conv-26,conv-30")
+    run.add_argument("--max-conversations", type=int)
+    run.add_argument("--max-questions", type=int, help="每段对话按固定种子抽多少题")
+    run.add_argument("--seed", type=int, default=0)
+    run.add_argument("--top-k", type=int, default=20, help="naive_rag 检索的块数")
+    run.add_argument("--chunk-turns", type=int, default=1, help="naive_rag 每块包含的对话轮数")
+    run.add_argument("--judge", choices=(*JUDGE_KINDS, "both", "none"), default="both")
+    run.add_argument("--workers", type=int, default=8)
+    run.add_argument("--mock", action="store_true", help="离线占位模型，只检查流程，不调用 API")
+
+    judge = sub.add_parser("judge", help="对已有运行补做裁判")
+    judge.add_argument("--run-name", required=True)
+    judge.add_argument("--kind", choices=(*JUDGE_KINDS, "both"), default="both")
+    judge.add_argument("--workers", type=int, default=8)
+
+    report = sub.add_parser("report", help="重新生成汇总表")
+    report.add_argument("--run-name", required=True)
+
+    audit = sub.add_parser("audit-export", help="抽样导出裁判结果，供人工标注")
+    audit.add_argument("--run-name", required=True)
+    audit.add_argument("--kind", choices=JUDGE_KINDS, default="strict")
+    audit.add_argument("--n", type=int, default=100)
+    audit.add_argument("--seed", type=int, default=0)
+
+    agreement = sub.add_parser("audit-score", help="计算人工标注与裁判的一致率")
+    agreement.add_argument("--csv", type=Path, required=True)
+
+    sweep = sub.add_parser("retrieval-sweep", help="只量朴素 RAG 的证据召回，不调用 LLM、不花钱")
+    sweep.add_argument("--top-k", type=_int_list, default=(1, 3, 5, 10, 20))
+    sweep.add_argument("--chunk-turns", type=_int_list, default=(1, 2, 4))
+    sweep.add_argument("--categories", type=_int_list, default=DEFAULT_CATEGORIES)
+    return parser
+
+
+def _download(settings: Settings) -> None:
+    import httpx
+
+    target = settings.locomo_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    response = httpx.get(LOCOMO_URL, follow_redirects=True, timeout=120)
+    response.raise_for_status()
+    target.write_bytes(response.content)
+    samples = load_locomo(target)
+    print(f"已下载 {target}：{len(samples)} 段对话，{sum(len(s.qa) for s in samples)} 道题")
+
+
+def _report(settings: Settings, run_name: str) -> None:
+    summarize(run_name, settings)
+    print((settings.runs_dir / run_name / SUMMARY_MD).read_text(encoding="utf-8"))
+
+
+def main(argv: list[str] | None = None) -> int:
+    # Windows consoles default to GBK; never crash on a character it cannot show.
+    sys.stdout.reconfigure(errors="replace")
+    args = build_parser().parse_args(argv)
+    try:
+        return _dispatch(args, Settings.from_env())
+    except (ValueError, FileNotFoundError, FileExistsError, RunMismatchError) as error:
+        print(f"错误：{error}", file=sys.stderr)
+        return 1
+
+
+def _dispatch(args: argparse.Namespace, settings: Settings) -> int:
+    if args.command == "download-locomo":
+        _download(settings)
+    elif args.command == "run":
+        if not settings.locomo_path.exists():
+            print(f"缺少数据集 {settings.locomo_path}，请先执行 memocore download-locomo", file=sys.stderr)
+            return 1
+        cfg = RunConfig(
+            system=args.system,
+            run_name=args.run_name or args.system,
+            categories=args.categories,
+            conversations=args.conversations,
+            max_conversations=args.max_conversations,
+            max_questions=args.max_questions,
+            seed=args.seed,
+            top_k=args.top_k,
+            chunk_turns=args.chunk_turns,
+            mock=args.mock,
+        )
+        run_predictions(cfg, settings, workers=args.workers)
+        for kind in _judge_kinds(args.judge):
+            run_judge(cfg.run_name, kind, settings, workers=args.workers)
+        _report(settings, cfg.run_name)
+    elif args.command == "judge":
+        for kind in _judge_kinds(args.kind):
+            run_judge(args.run_name, kind, settings, workers=args.workers)
+        _report(settings, args.run_name)
+    elif args.command == "report":
+        _report(settings, args.run_name)
+    elif args.command == "audit-export":
+        path = export_audit(args.run_name, args.kind, settings, n=args.n, seed=args.seed)
+        print(f"已导出 {path}：在 human_label 列填 CORRECT / WRONG（或 对 / 错），再运行 memocore audit-score --csv {path}")
+    elif args.command == "audit-score":
+        print(json.dumps(score_audit(args.csv), ensure_ascii=False, indent=2))
+    elif args.command == "retrieval-sweep":
+        from memocore.retrieval_eval import render_sweep, retrieval_sweep
+
+        result = retrieval_sweep(
+            settings, top_ks=args.top_k, chunk_turns=args.chunk_turns, categories=args.categories
+        )
+        print(render_sweep(result))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
