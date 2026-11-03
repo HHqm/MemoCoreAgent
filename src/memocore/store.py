@@ -11,6 +11,7 @@ checks that, question by question).
 from __future__ import annotations
 
 import calendar
+import hashlib
 import re
 import sqlite3
 import threading
@@ -27,8 +28,11 @@ from memocore.retrieval.rerank import Reranker
 from memocore.systems.hybrid_rag import HybridOptions, HybridRAGSystem
 from memocore.temporal import time_note
 
-# The evaluated default read path (see docs/results/retrieval_ablation.md).
-DEFAULT_OPTIONS = HybridOptions(fusion="pool", rerank_candidates=50, time_anchors=True, feedback_turns=2)
+# The evaluated default read path (docs/results/retrieval_ablation.md, docs/results/optimization_rounds.md);
+# RunConfig's defaults must match it, which tests/test_store.py checks.
+DEFAULT_OPTIONS = HybridOptions(
+    fusion="pool", rerank_candidates=50, time_anchors=True, feedback_turns=2, time_candidates=20, speaker_boost=0.1
+)
 DEFAULT_BUDGET = 20
 # Without an explicit session key, a message more than this long after the previous one opens a new session.
 SESSION_GAP = timedelta(minutes=30)
@@ -54,6 +58,7 @@ CREATE TABLE IF NOT EXISTS turns (
     said_at TEXT NOT NULL,
     embedding_model TEXT NOT NULL,
     vector BLOB NOT NULL,
+    vector_key TEXT,  -- hash of the exact text the vector was computed from
     PRIMARY KEY (user, session, position)
 );
 CREATE TABLE IF NOT EXISTS revisions (
@@ -109,8 +114,17 @@ class Recall:
     context: str  # the memories rendered with ids and dates, in the format the answer prompt expects
 
 
+def _vector_key(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 class _StoredVectors:
-    """Serves the vectors saved at write time, so a read never re-encodes stored turns."""
+    """Serves the vectors saved at write time, so a read never re-encodes stored turns.
+
+    Vectors are found by a hash of the exact text they were computed from. When that text no longer
+    matches, as when a forgotten turn was part of the next turn's indexed context, the turn is encoded
+    afresh instead of being served a stale vector.
+    """
 
     def __init__(self, inner: Embedder, vectors: dict[str, np.ndarray]):
         self.inner = inner
@@ -118,9 +132,10 @@ class _StoredVectors:
         self._vectors = vectors
 
     def encode(self, texts: Sequence[str]) -> np.ndarray:
-        missing = [text for text in dict.fromkeys(texts) if text not in self._vectors]
-        fresh = dict(zip(missing, self.inner.encode(missing))) if missing else {}
-        return np.stack([self._vectors.get(text, fresh.get(text)) for text in texts])
+        keys = [_vector_key(text) for text in texts]
+        missing = {key: text for key, text in zip(keys, texts) if key not in self._vectors}
+        fresh = dict(zip(missing, self.inner.encode(list(missing.values())))) if missing else {}
+        return np.stack([self._vectors.get(key, fresh.get(key)) for key in keys])
 
 
 class MemoryStore:
@@ -133,6 +148,9 @@ class MemoryStore:
         options: HybridOptions = DEFAULT_OPTIONS,
         budget: int = DEFAULT_BUDGET,
     ):
+        if options.context_after:
+            # Each vector is computed once, when its turn is written; a later turn cannot change it.
+            raise ValueError("MemoryStore indexes turns as they arrive, so context_after must be 0")
         self.embedder = embedder
         self.reranker = reranker
         self.options = options
@@ -143,6 +161,8 @@ class MemoryStore:
         # Deleted rows are overwritten on disk, not just unlinked, so forgotten text cannot be recovered from the file.
         self._db.execute("PRAGMA secure_delete = ON")
         self._db.executescript(_SCHEMA)
+        if "vector_key" not in {row[1] for row in self._db.execute("PRAGMA table_info(turns)")}:
+            self._db.execute("ALTER TABLE turns ADD COLUMN vector_key TEXT")  # stores created before the column
         self._lock = threading.Lock()
         self._systems: dict[str, tuple[int, HybridRAGSystem]] = {}
 
@@ -159,6 +179,7 @@ class MemoryStore:
         utterances = list(utterances)
         with self._lock, self._db:
             staged = []
+            recent: dict[int, list[Turn]] = {}  # per session, the turns before the one being staged
             for utterance in utterances:
                 if not utterance.text.strip() and not utterance.image:
                     raise ValueError("cannot remember an empty message")
@@ -173,19 +194,36 @@ class MemoryStore:
                 # Times are resolved against the session date, as in the evaluated write path.
                 turn = Turn(f"D{number}:{position}", utterance.speaker, utterance.text, utterance.image)
                 turn = replace(turn, time_note=time_note(turn.text, started_at.date()))
-                staged.append((number, position, at, stamp, turn))
-            vectors = self.embedder.encode([Session(n, stamp, (turn,)).render([turn]) for n, _, _, stamp, turn in staged])
+                if number not in recent:
+                    recent[number] = self._last_turns(user, number)
+                # The same text HybridRAGSystem indexes: the turn with its `context_before` predecessors.
+                window = recent[number][-self.options.context_before:] if self.options.context_before else []
+                indexed = Session(number, stamp, ()).render([*window, turn])
+                recent[number].append(turn)
+                staged.append((number, position, at, stamp, turn, indexed))
+            vectors = self.embedder.encode([indexed for *_, indexed in staged])
             self._db.executemany(
-                "INSERT INTO turns VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO turns VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 [
                     (user, number, position, turn.speaker, turn.text, turn.image_caption, turn.time_note,
-                     at.isoformat(), self.embedder.name, np.asarray(vector, dtype=np.float32).tobytes())
-                    for (number, position, at, _, turn), vector in zip(staged, vectors)
+                     at.isoformat(), self.embedder.name, np.asarray(vector, dtype=np.float32).tobytes(),
+                     _vector_key(indexed))
+                    for (number, position, at, _, turn, indexed), vector in zip(staged, vectors)
                 ],
             )
             self._bump(user)
         return [Memory(turn.dia_id, turn.speaker, turn.text, stamp, turn.image_caption, turn.time_note)
-                for _, _, _, stamp, turn in staged]
+                for _, _, _, stamp, turn, _ in staged]
+
+    def _last_turns(self, user: str, session: int) -> list[Turn]:
+        if not self.options.context_before:
+            return []
+        rows = self._db.execute(
+            "SELECT position, speaker, text, image, time_note FROM turns WHERE user = ? AND session = ? "
+            "ORDER BY position DESC LIMIT ?",
+            (user, session, self.options.context_before),
+        ).fetchall()
+        return [Turn(f"D{session}:{position}", speaker, text, image, note) for position, speaker, text, image, note in reversed(rows)]
 
     def _session_for(self, user: str, key: str | None, at: datetime) -> tuple[int, datetime]:
         last = self._db.execute(
@@ -268,8 +306,8 @@ class MemoryStore:
         if cached and cached[0] == revision:
             return cached[1]
         rows = self._db.execute(
-            "SELECT s.number, s.started_at, t.position, t.speaker, t.text, t.image, t.embedding_model, t.vector "
-            "FROM turns t JOIN sessions s ON s.user = t.user AND s.number = t.session "
+            "SELECT s.number, s.started_at, t.position, t.speaker, t.text, t.image, t.embedding_model, t.vector, "
+            "t.vector_key FROM turns t JOIN sessions s ON s.user = t.user AND s.number = t.session "
             "WHERE t.user = ? ORDER BY t.session, t.position",
             (user,),
         ).fetchall()
@@ -277,13 +315,11 @@ class MemoryStore:
             return None
         sessions: dict[int, tuple[str, list[Turn]]] = {}
         vectors: dict[str, np.ndarray] = {}
-        for number, started_at, position, speaker, text, image, model, blob in rows:
+        for number, started_at, position, speaker, text, image, model, blob, key in rows:
             stamp = format_session_time(datetime.fromisoformat(started_at))
-            turn = Turn(f"D{number}:{position}", speaker, text, image)
-            sessions.setdefault(number, (stamp, []))[1].append(turn)
-            if model == self.embedder.name:
-                anchored = replace(turn, time_note=time_note(text, datetime.fromisoformat(started_at).date()))
-                vectors[Session(number, stamp, (anchored,)).render([anchored])] = np.frombuffer(blob, dtype=np.float32)
+            sessions.setdefault(number, (stamp, []))[1].append(Turn(f"D{number}:{position}", speaker, text, image))
+            if model == self.embedder.name and key:
+                vectors[key] = np.frombuffer(blob, dtype=np.float32)
         conversation = Conversation(
             user, "", "", tuple(Session(number, stamp, tuple(turns)) for number, (stamp, turns) in sessions.items())
         )

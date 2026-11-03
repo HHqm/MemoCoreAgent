@@ -6,15 +6,15 @@
   "questions": 1540,
   "identical_to_evaluated_system": 1540,
   "mismatched": [],
-  "recall": 0.8752818220402694,
-  "all_evidence_rate": 0.8190104166666666,
+  "recall": 0.8838177016698991,
+  "all_evidence_rate": 0.828125,
   "by_category": {
-    "multi-hop": 0.7387934092161416,
-    "temporal": 0.911993769470405,
-    "open-domain": 0.6160485933503836,
-    "single-hop": 0.9353943717796274
+    "multi-hop": 0.7474616519269375,
+    "temporal": 0.9156282450674975,
+    "open-domain": 0.6323529411764707,
+    "single-hop": 0.9449068569163693
   },
-  "add_ms_per_turn": 8.24,
-  "search_ms_per_question": 3.44,
-  "db_bytes": 27299840
+  "add_ms_per_turn": 8.14,
+  "search_ms_per_question": 3.4,
+  "db_bytes": 27312128
 }

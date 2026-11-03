@@ -81,6 +81,10 @@ class RunConfig:
     time_anchors: bool = True
     # Chosen with `memocore retrieval-ablation`: +1.2 points evidence recall at 20 turns, +4.2 on multi-hop.
     feedback_turns: int = 2
+    # Chosen in the five optimisation rounds (docs/results/optimization_rounds.md).
+    context_before: int = 0
+    time_candidates: int = 20
+    speaker_boost: float = 0.1
     prompt: str = DEFAULT_PROMPT
     mock: bool = False
 
@@ -93,6 +97,9 @@ class RunConfig:
             max_per_session=self.max_per_session,
             time_anchors=self.time_anchors,
             feedback_turns=self.feedback_turns,
+            context_before=self.context_before,
+            time_candidates=self.time_candidates,
+            speaker_boost=self.speaker_boost,
         )
 
 
@@ -244,6 +251,9 @@ def _identity(
         "max_per_session": cfg.max_per_session if hybrid else None,
         "time_anchors": cfg.time_anchors if hybrid else None,
         "feedback_turns": cfg.feedback_turns if hybrid else None,
+        "context_before": cfg.context_before if hybrid else None,
+        "time_candidates": cfg.time_candidates if hybrid else None,
+        "speaker_boost": cfg.speaker_boost if hybrid else None,
         "reranker_model": reranker.name if reranker else None,
     }
 
@@ -461,7 +471,9 @@ def render_markdown(summary: dict[str, Any]) -> str:
             f"预算 {info['top_k']} 轮，BM25 {info.get('fusion')}，重排候选 {info['rerank_candidates']}（`{reranker}`），"
             f"邻近 ±{info['neighbors']} 轮，每会话上限 {info['max_per_session'] or '不限'}，"
             f"时间锚定 {'开' if info.get('time_anchors') else '关'}，"
-            f"伪相关反馈 {info.get('feedback_turns') or '关'}"
+            f"伪相关反馈 {info.get('feedback_turns') or '关'}，"
+            f"上文索引 {info.get('context_before') or 0} 轮，时间候选 {info.get('time_candidates') or 0}，"
+            f"说话人加分 {info.get('speaker_boost') or 0}"
         )
     lines = [f"# 评测结果：{summary['run']}", "", " · ".join(meta), ""]
     if info.get("mock"):

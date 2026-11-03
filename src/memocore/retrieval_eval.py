@@ -26,8 +26,6 @@ from memocore.systems import HybridOptions, HybridRAGSystem, NaiveRAGSystem
 
 SWEEP_JSON = "retrieval_sweep.json"
 SWEEP_MD = "retrieval_sweep.md"
-ABLATION_JSON = "retrieval_ablation.json"
-ABLATION_MD = "retrieval_ablation.md"
 
 
 def retrieval_sweep(
@@ -127,6 +125,13 @@ ABLATION_CONFIGS: dict[str, HybridOptions] = {
     "dense+bm25(pool)+rerank50+time+feedback": HybridOptions(
         fusion="pool", rerank_candidates=50, time_anchors=True, feedback_turns=2
     ),
+    # Rounds 2 and 3 of docs/results/optimization_rounds.md; the last row is the default read path.
+    "...+feedback+time-query": HybridOptions(
+        fusion="pool", rerank_candidates=50, time_anchors=True, feedback_turns=2, time_candidates=20
+    ),
+    "...+feedback+time-query+speaker": HybridOptions(
+        fusion="pool", rerank_candidates=50, time_anchors=True, feedback_turns=2, time_candidates=20, speaker_boost=0.1
+    ),
 }
 
 
@@ -139,6 +144,7 @@ def retrieval_ablation(
     embedder: Embedder | None = None,
     reranker: Reranker | None = None,
     progress: bool = True,
+    out_name: str = "retrieval_ablation",
 ) -> dict[str, Any]:
     """Evidence recall of each read-path configuration at the same turn budgets. No LLM calls."""
     configs = configs or ABLATION_CONFIGS
@@ -205,8 +211,8 @@ def retrieval_ablation(
     if isinstance(reranker, CrossEncoderReranker) and reranker.pairs_scored:
         result["reranker_pairs_per_second"] = round(reranker.pairs_scored / reranker.model_seconds, 1)
     settings.runs_dir.mkdir(parents=True, exist_ok=True)
-    (settings.runs_dir / ABLATION_JSON).write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-    (settings.runs_dir / ABLATION_MD).write_text(render_ablation(result), encoding="utf-8")
+    (settings.runs_dir / f"{out_name}.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    (settings.runs_dir / f"{out_name}.md").write_text(render_ablation(result), encoding="utf-8")
     return result
 
 

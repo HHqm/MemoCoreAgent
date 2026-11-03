@@ -89,11 +89,40 @@ class HybridSystemTest(unittest.TestCase):
         self.assertEqual(sorted(ranked), list(range(len(self.conversation.turn_ids))))  # nothing lost or duplicated
         with self.assertRaises(ValueError):
             HybridRAGSystem(HashingEmbedder(), options=HybridOptions(feedback_turns=2))
+        with self.assertRaises(ValueError):
+            HybridRAGSystem(HashingEmbedder(), options=HybridOptions(time_candidates=20))
 
     def test_time_anchors_reach_the_context(self):
         system = self._system(time_anchors=True)
         context = system.retrieve("When did Alice adopt Max?")
         self.assertIn("yesterday = 7 May 2023", context.text)
+
+    def test_context_is_indexed_but_not_returned(self):
+        system = self._system(context_before=1)
+        self.assertIn("golden retriever", system._index_texts[1])  # D1:2 is indexed with D1:1 before it
+        self.assertNotIn("golden retriever", system._texts[1])
+        self.assertEqual(system._index_texts[3], system._texts[3])  # D2:1 opens session 2: no context across sessions
+        context = system.retrieve("Who is learning the violin?")
+        self.assertEqual(context.turn_ids, ("D1:2",))
+        self.assertNotIn("golden retriever", context.text)
+
+    def test_time_window_lifts_turns_from_the_named_period(self):
+        question = ["What happened in June 2023?"]
+        plain = self._system(rerank_candidates=5).rank(question)[0]
+        dated = self._system(rerank_candidates=5, time_anchors=True, time_boost=100.0, time_candidates=5).rank(question)[0]
+        system = self._system(rerank_candidates=5)
+        self.assertEqual(set(system.turn_ids(dated[:2])), {"D2:1", "D2:2"})  # session 2 is dated 20 June 2023
+        self.assertEqual(sorted(dated), sorted(plain))  # reordered, nothing filtered out
+
+    def test_speaker_prior_favours_the_person_named(self):
+        def ranking(question, boost):
+            return self._system(use_bm25=False, speaker_boost=boost).rank([question])[0]
+
+        bob_first = self._system(use_bm25=False).turn_ids(ranking("What did Bob say about Max?", 10.0)[:2])
+        self.assertEqual(set(bob_first), {"D1:2", "D2:1"})  # Bob's two turns
+        both = "What did Alice and Bob talk about?"
+        self.assertEqual(ranking(both, 10.0), ranking(both, 0.0))  # two names: no prior
+        self.assertEqual(sorted(ranking("What did Bob say?", 10.0)), list(range(5)))  # nothing filtered out
 
     def test_invalid_combinations(self):
         with self.assertRaises(ValueError):

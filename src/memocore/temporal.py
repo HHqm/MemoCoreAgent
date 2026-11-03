@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import calendar
 import re
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import date, timedelta
 from typing import Callable
 
@@ -155,3 +155,69 @@ def anchor_conversation(conversation: Conversation) -> Conversation:
         )
         sessions.append(Session(session.index, session.date_time, turns))
     return replace(conversation, sessions=tuple(sessions))
+
+
+# --- Read side: the time a question asks about ------------------------------------------------------
+
+_MONTH_NAMES = "January|February|March|April|May|June|July|August|September|October|November|December"
+_DAY_MONTH_YEAR = re.compile(rf"\b(\d{{1,2}})(?:st|nd|rd|th)?\s+({_MONTH_NAMES}),?\s+(\d{{4}})\b", re.IGNORECASE)
+_MONTH_DAY_YEAR = re.compile(rf"\b({_MONTH_NAMES})\s+(\d{{1,2}})(?:st|nd|rd|th)?,?\s+(\d{{4}})\b", re.IGNORECASE)
+_MONTH_YEAR = re.compile(rf"\b({_MONTH_NAMES}),?\s+(\d{{4}})\b", re.IGNORECASE)
+# A bare month needs a preposition, so the verb "may" is not read as a month.
+_BARE_MONTH = re.compile(rf"\b(?:in|during|of|since|until|by)\s+({_MONTH_NAMES})\b")
+_NOTE_DAY = re.compile(rf"\b(\d{{1,2}})\s+({_MONTH_NAMES})\s+(\d{{4}})\b")
+_NOTE_MONTH = re.compile(rf"\b({_MONTH_NAMES})\s+(\d{{4}})\b")
+# "On 3 June" usually means the conversation of that day, which talks about the days just before it.
+DAY_LOOKBACK = timedelta(days=7)
+
+
+@dataclass(frozen=True)
+class TimeWindow:
+    start: date | None = None
+    end: date | None = None
+    month: int | None = None  # a month named without a year: that month in any year
+
+    def overlaps(self, start: date, end: date) -> bool:
+        if self.month is not None:
+            return any(d.month == self.month for d in (start, end)) or (start.month < self.month < end.month)
+        return start <= self.end and self.start <= end
+
+
+def _month_span(year: int, month: int) -> tuple[date, date]:
+    return date(year, month, 1), date(year, month, calendar.monthrange(year, month)[1])
+
+
+def question_window(question: str) -> TimeWindow | None:
+    """The period a question names explicitly ("on 3 June, 2023", "in October 2023", "in July"), if any."""
+    for pattern, order in ((_DAY_MONTH_YEAR, (0, 1, 2)), (_MONTH_DAY_YEAR, (1, 0, 2))):
+        match = pattern.search(question)
+        if match:
+            parts = match.groups()
+            day, month, year = (parts[i] for i in order)
+            try:
+                said = date(int(year), _MONTHS[month.lower()], int(day))
+            except ValueError:
+                continue
+            return TimeWindow(said - DAY_LOOKBACK, said)
+    match = _MONTH_YEAR.search(question)
+    if match:
+        return TimeWindow(*_month_span(int(match.group(2)), _MONTHS[match.group(1).lower()]))
+    match = _BARE_MONTH.search(question)
+    if match:
+        return TimeWindow(month=_MONTHS[match.group(1).lower()])
+    return None
+
+
+def turn_spans(session_date: date | None, note: str | None) -> list[tuple[date, date]]:
+    """When a turn was said, plus every day or month its time note resolved to."""
+    spans = [(session_date, session_date)] if session_date else []
+    if note:
+        for day, month, year in _NOTE_DAY.findall(note):
+            try:
+                resolved = date(int(year), _MONTHS[month.lower()], int(day))
+            except ValueError:
+                continue
+            spans.append((resolved - DAY_LOOKBACK, resolved))  # "the week before 8 May" ends on the day named
+        for month, year in _NOTE_MONTH.findall(_NOTE_DAY.sub(" ", note)):  # months not already part of a day
+            spans.append(_month_span(int(year), _MONTHS[month.lower()]))
+    return spans

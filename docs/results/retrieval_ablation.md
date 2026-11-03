@@ -17,6 +17,8 @@
 | dense+rerank50+time | 75.9% | +16.6 | 69.5% | 52.4% | 84.5% | 44.6% | 84.0% | 53.4% | 64.5% | 1,246 |
 | dense+bm25(pool)+rerank50+time | 77.5% | +18.2 | 71.3% | 53.6% | 85.1% | 44.6% | 86.2% | 54.4% | 64.8% | 1,255 |
 | dense+bm25(pool)+rerank50+time+feedback | 77.9% | +18.6 | 71.7% | 55.0% | 85.4% | 44.6% | 86.3% | 54.6% | 64.8% | 1,262 |
+| ...+feedback+time-query | 78.1% | +18.7 | 71.8% | 55.2% | 85.4% | 44.6% | 86.6% | 55.0% | 65.7% | 1,263 |
+| ...+feedback+time-query+speaker | 78.5% | +19.1 | 72.3% | 55.2% | 85.4% | 45.7% | 87.2% | 55.0% | 65.4% | 1,263 |
 
 ## 预算 10 轮
 
@@ -31,6 +33,8 @@
 | dense+rerank50+time | 80.9% | +12.3 | 74.2% | 60.9% | 87.3% | 52.9% | 88.3% | 57.9% | 67.9% | 2,374 |
 | dense+bm25(pool)+rerank50+time | 83.1% | +14.5 | 76.6% | 63.1% | 88.3% | 53.1% | 91.2% | 59.1% | 67.9% | 2,393 |
 | dense+bm25(pool)+rerank50+time+feedback | 83.5% | +14.9 | 77.1% | 64.2% | 88.0% | 54.8% | 91.4% | 59.4% | 68.2% | 2,415 |
+| ...+feedback+time-query | 83.7% | +15.1 | 77.3% | 64.3% | 87.9% | 55.3% | 91.8% | 59.7% | 68.8% | 2,418 |
+| ...+feedback+time-query+speaker | 84.1% | +15.5 | 77.7% | 64.5% | 88.1% | 55.3% | 92.3% | 60.1% | 68.8% | 2,421 |
 
 ## 预算 20 轮
 
@@ -45,15 +49,18 @@
 | dense+rerank50+time | 84.2% | +7.8 | 77.9% | 67.3% | 90.6% | 59.0% | 90.1% | 60.8% | 70.4% | 4,383 |
 | dense+bm25(pool)+rerank50+time | 86.4% | +10.0 | 80.4% | 69.8% | 91.2% | 59.9% | 93.0% | 61.9% | 70.4% | 4,421 |
 | dense+bm25(pool)+rerank50+time+feedback | 87.5% | +11.2 | 81.9% | 73.9% | 91.2% | 61.6% | 93.5% | 62.7% | 70.7% | 4,504 |
+| ...+feedback+time-query | 87.8% | +11.5 | 82.2% | 74.1% | 91.4% | 62.1% | 93.9% | 63.1% | 71.3% | 4,506 |
+| ...+feedback+time-query+speaker | 88.4% | +12.0 | 82.8% | 74.7% | 91.6% | 63.2% | 94.5% | 63.6% | 71.3% | 4,520 |
 
 单题排序耗时（毫秒，向量与重排分数命中磁盘缓存时会更快）：
 - dense：0.06
-- dense+bm25(rrf)：1.1
-- dense+rerank20：0.27
-- dense+rerank50：0.48
-- dense+bm25(rrf)+rerank50：1.57
-- dense+bm25(pool)+rerank50：1.54
-- dense+rerank50+time：0.48
-- dense+bm25(pool)+rerank50+time：1.53
-- dense+bm25(pool)+rerank50+time+feedback：6.83
-- 重排模型实际吞吐 137.4 对/秒，即 50 个候选约 364 ms/题（不含缓存）
+- dense+bm25(rrf)：1.11
+- dense+rerank20：0.3
+- dense+rerank50：0.54
+- dense+bm25(rrf)+rerank50：1.64
+- dense+bm25(pool)+rerank50：1.6
+- dense+rerank50+time：0.54
+- dense+bm25(pool)+rerank50+time：1.59
+- dense+bm25(pool)+rerank50+time+feedback：2.37
+- ...+feedback+time-query：2.48
+- ...+feedback+time-query+speaker：2.47

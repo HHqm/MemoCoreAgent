@@ -553,18 +553,139 @@
         "single-hop": 0.7312722948870393
       },
       "context_chars": 4503.527922077922
+    },
+    {
+      "config": "...+feedback+time-query",
+      "budget": 5,
+      "recall": 0.7806063196685172,
+      "all_evidence_rate": 0.7180989583333334,
+      "by_category": {
+        "multi-hop": 0.551840957971977,
+        "temporal": 0.8541017653167187,
+        "open-domain": 0.4462915601023018,
+        "single-hop": 0.8658343242172017
+      },
+      "answer_visible": 0.55,
+      "answer_visible_by_category": {
+        "multi-hop": 0.2765957446808511,
+        "temporal": 0.6573208722741433,
+        "open-domain": 0.08333333333333333,
+        "single-hop": 0.6539833531510107
+      },
+      "context_chars": 1262.9597402597403
+    },
+    {
+      "config": "...+feedback+time-query",
+      "budget": 10,
+      "recall": 0.8373253866106517,
+      "all_evidence_rate": 0.7734375,
+      "by_category": {
+        "multi-hop": 0.6432847646733425,
+        "temporal": 0.8785046728971962,
+        "open-domain": 0.5531756180733163,
+        "single-hop": 0.9177566389219184
+      },
+      "answer_visible": 0.5974025974025974,
+      "answer_visible_by_category": {
+        "multi-hop": 0.35815602836879434,
+        "temporal": 0.6884735202492211,
+        "open-domain": 0.08333333333333333,
+        "single-hop": 0.7015457788347206
+      },
+      "context_chars": 2418.025974025974
+    },
+    {
+      "config": "...+feedback+time-query",
+      "budget": 20,
+      "recall": 0.8782115095402694,
+      "all_evidence_rate": 0.822265625,
+      "by_category": {
+        "multi-hop": 0.7405664588615317,
+        "temporal": 0.9135514018691588,
+        "open-domain": 0.6214833759590793,
+        "single-hop": 0.9389615537059056
+      },
+      "answer_visible": 0.6311688311688312,
+      "answer_visible_by_category": {
+        "multi-hop": 0.40425531914893614,
+        "temporal": 0.7133956386292835,
+        "open-domain": 0.10416666666666667,
+        "single-hop": 0.7360285374554102
+      },
+      "context_chars": 4506.261038961039
+    },
+    {
+      "config": "...+feedback+time-query+speaker",
+      "budget": 5,
+      "recall": 0.7845125696685172,
+      "all_evidence_rate": 0.72265625,
+      "by_category": {
+        "multi-hop": 0.551840957971977,
+        "temporal": 0.8541017653167187,
+        "open-domain": 0.4571611253196931,
+        "single-hop": 0.8717796274276655
+      },
+      "answer_visible": 0.55,
+      "answer_visible_by_category": {
+        "multi-hop": 0.2730496453900709,
+        "temporal": 0.6542056074766355,
+        "open-domain": 0.08333333333333333,
+        "single-hop": 0.6563614744351962
+      },
+      "context_chars": 1263.0720779220778
+    },
+    {
+      "config": "...+feedback+time-query+speaker",
+      "budget": 10,
+      "recall": 0.8406999525828739,
+      "all_evidence_rate": 0.77734375,
+      "by_category": {
+        "multi-hop": 0.6451169159735789,
+        "temporal": 0.8805815160955348,
+        "open-domain": 0.5531756180733163,
+        "single-hop": 0.9225128814902894
+      },
+      "answer_visible": 0.6006493506493507,
+      "answer_visible_by_category": {
+        "multi-hop": 0.3617021276595745,
+        "temporal": 0.6884735202492211,
+        "open-domain": 0.08333333333333333,
+        "single-hop": 0.7063020214030915
+      },
+      "context_chars": 2420.8
+    },
+    {
+      "config": "...+feedback+time-query+speaker",
+      "budget": 20,
+      "recall": 0.8838177016698991,
+      "all_evidence_rate": 0.828125,
+      "by_category": {
+        "multi-hop": 0.7474616519269375,
+        "temporal": 0.9156282450674975,
+        "open-domain": 0.6323529411764707,
+        "single-hop": 0.9449068569163693
+      },
+      "answer_visible": 0.6363636363636364,
+      "answer_visible_by_category": {
+        "multi-hop": 0.41134751773049644,
+        "temporal": 0.7133956386292835,
+        "open-domain": 0.10416666666666667,
+        "single-hop": 0.7431629013079667
+      },
+      "context_chars": 4519.537662337662
     }
   ],
   "rank_ms_per_question": {
     "dense": 0.06,
-    "dense+bm25(rrf)": 1.1,
-    "dense+rerank20": 0.27,
-    "dense+rerank50": 0.48,
-    "dense+bm25(rrf)+rerank50": 1.57,
-    "dense+bm25(pool)+rerank50": 1.54,
-    "dense+rerank50+time": 0.48,
-    "dense+bm25(pool)+rerank50+time": 1.53,
-    "dense+bm25(pool)+rerank50+time+feedback": 6.83
-  },
-  "reranker_pairs_per_second": 137.4
+    "dense+bm25(rrf)": 1.11,
+    "dense+rerank20": 0.3,
+    "dense+rerank50": 0.54,
+    "dense+bm25(rrf)+rerank50": 1.64,
+    "dense+bm25(pool)+rerank50": 1.6,
+    "dense+rerank50+time": 0.54,
+    "dense+bm25(pool)+rerank50+time": 1.59,
+    "dense+bm25(pool)+rerank50+time+feedback": 2.37,
+    "...+feedback+time-query": 2.48,
+    "...+feedback+time-query+speaker": 2.47
+  }
 }

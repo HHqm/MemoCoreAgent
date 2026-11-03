@@ -2,7 +2,15 @@ import unittest
 from datetime import date
 
 from memocore.datasets.locomo import load_locomo
-from memocore.temporal import anchor_conversation, anchor_text, parse_session_date, time_note
+from memocore.temporal import (
+    TimeWindow,
+    anchor_conversation,
+    anchor_text,
+    parse_session_date,
+    question_window,
+    time_note,
+    turn_spans,
+)
 from tests.helpers import FIXTURE
 
 THURSDAY = date(2023, 5, 25)
@@ -61,3 +69,26 @@ class TemporalAnchorTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class QuestionWindowTest(unittest.TestCase):
+    def test_days_months_and_bare_months(self):
+        self.assertEqual(question_window("Who did Maria have dinner with on May 3, 2023?"),
+                         TimeWindow(date(2023, 4, 26), date(2023, 5, 3)))
+        self.assertEqual(question_window("What did she start, as mentioned on 3 June, 2023?"),
+                         TimeWindow(date(2023, 5, 27), date(2023, 6, 3)))
+        self.assertEqual(question_window("What did Maria donate in December 2023?"),
+                         TimeWindow(date(2023, 12, 1), date(2023, 12, 31)))
+        self.assertEqual(question_window("When did Melanie go camping in June?"), TimeWindow(month=6))
+
+    def test_no_window_without_an_explicit_period(self):
+        for question in ("What may Caroline do next?", "When did John meet Sam?", "How often did she run in 2023?"):
+            self.assertIsNone(question_window(question))
+
+    def test_turn_spans_cover_the_session_day_and_resolved_times(self):
+        spans = turn_spans(date(2023, 7, 3), "time: last week = the week before 3 July 2023; next month = August 2023")
+        self.assertIn((date(2023, 6, 26), date(2023, 7, 3)), spans)
+        self.assertIn((date(2023, 8, 1), date(2023, 8, 31)), spans)
+        self.assertNotIn((date(2023, 7, 1), date(2023, 7, 31)), spans)  # July only as part of a day
+        self.assertTrue(TimeWindow(month=8).overlaps(date(2023, 8, 1), date(2023, 8, 31)))
+        self.assertFalse(TimeWindow(date(2023, 9, 1), date(2023, 9, 30)).overlaps(date(2023, 8, 1), date(2023, 8, 31)))

@@ -64,6 +64,12 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--rerank-candidates", type=int, default=50, help="hybrid_rag 交给重排模型的候选数，0 关闭重排")
     run.add_argument("--no-time-anchors", action="store_true", help="hybrid_rag 关闭写入时的时间锚定")
     run.add_argument("--feedback-turns", type=int, default=2, help="hybrid_rag 伪相关反馈取前几轮做第二跳，0 关闭")
+    run.add_argument("--context-before", type=int, default=RunConfig.context_before,
+                     help="hybrid_rag 编码每轮时带上同一会话里的前几轮（只用于检索，不进上下文）")
+    run.add_argument("--time-candidates", type=int, default=RunConfig.time_candidates,
+                     help="hybrid_rag 问题点名时间时，补进重排候选的该时段轮数，0 关闭")
+    run.add_argument("--speaker-boost", type=float, default=RunConfig.speaker_boost,
+                     help="hybrid_rag 问题只点名一位说话人时，给其发言的向量相似度加分，0 关闭")
     run.add_argument("--neighbors", type=int, default=0, help="hybrid_rag 每个命中额外带上前后几轮")
     run.add_argument("--max-per-session", type=int, help="hybrid_rag 每个会话最多命中几次")
     run.add_argument(
@@ -173,6 +179,9 @@ def _dispatch(args: argparse.Namespace, settings: Settings) -> int:
             max_per_session=args.max_per_session,
             time_anchors=not args.no_time_anchors,
             feedback_turns=args.feedback_turns,
+            context_before=args.context_before,
+            time_candidates=args.time_candidates,
+            speaker_boost=args.speaker_boost,
             mock=args.mock,
         )
         run_predictions(cfg, settings, workers=args.workers)
