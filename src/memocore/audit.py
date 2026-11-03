@@ -26,6 +26,7 @@ from memocore.stats import cohen_kappa, wilson_ci
 CORRECT, WRONG, UNSURE = "CORRECT", "WRONG", "UNSURE"
 AUDIT_FIELDS = [
     "item", "question", "gold", "prediction", "evidence", "human_label", "note", "category", "run", "qa_id", "judge",
+    "labeler",  # who gave the reference label: "human", or the model that stood in for one
 ]
 _HUMAN_LABELS = {
     "correct": CORRECT, "c": CORRECT, "1": CORRECT, "y": CORRECT, "yes": CORRECT, "对": CORRECT,
@@ -172,6 +173,7 @@ def label_audit(path: Path, *, ask: Callable[[str], str] = input, show: Callable
                 show("请输入 1、0、?、b 或 q")
                 continue
             row["human_label"] = label
+            row["labeler"] = "human"
             row["note"] = ask("备注（可留空）> ").strip() if label == UNSURE else ""
         except (EOFError, KeyboardInterrupt):
             break
@@ -230,7 +232,10 @@ def score_audit(path: Path, settings: Settings) -> dict[str, Any]:
     agree = sum(judge == human for judge, human in labeled)
     judge_accuracy = fmean(judge == CORRECT for judge, _ in labeled) if labeled else None
     human_accuracy = fmean(human == CORRECT for _, human in labeled) if labeled else None
+    labelers = Counter(row.get("labeler") or "human" for row in rows if human_label(row["human_label"]))
     return {
+        # Only a human labeler makes this a human audit; a model label measures agreement between judges.
+        "labelers": dict(labelers),
         "total": len(rows),
         "labeled": len(labeled),
         "unsure": len(unsure),

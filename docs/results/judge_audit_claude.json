@@ -1,0 +1,277 @@
+{
+  "labelers": {
+    "claude-opus-5.5": 100
+  },
+  "total": 100,
+  "labeled": 100,
+  "unsure": 0,
+  "agreement": 0.8,
+  "agreement_ci": [
+    0.7111690380734977,
+    0.8666340774409013
+  ],
+  "kappa": 0.6147919876733436,
+  "judge_accuracy": 0.42,
+  "human_accuracy": 0.62,
+  "judge_too_lenient": 0,
+  "judge_too_strict": 20,
+  "by_run": {
+    "s300-full_context": {
+      "n": 26,
+      "agreement": 0.8076923076923077
+    },
+    "s300-hybrid_rag": {
+      "n": 24,
+      "agreement": 0.7083333333333334
+    },
+    "s300-hybrid_rag-v3": {
+      "n": 24,
+      "agreement": 0.75
+    },
+    "s300-naive_rag": {
+      "n": 26,
+      "agreement": 0.9230769230769231
+    }
+  },
+  "by_category": {
+    "multi-hop": {
+      "n": 19,
+      "agreement": 0.8421052631578947
+    },
+    "open-domain": {
+      "n": 7,
+      "agreement": 0.8571428571428571
+    },
+    "single-hop": {
+      "n": 54,
+      "agreement": 0.7777777777777778
+    },
+    "temporal": {
+      "n": 20,
+      "agreement": 0.8
+    }
+  },
+  "disagreements": [
+    {
+      "item": "9",
+      "run": "s300-full_context",
+      "qa_id": "conv-47#q0003",
+      "question": "Do both James and John have pets?",
+      "gold": "No",
+      "prediction": "No, only James has pets.",
+      "judge": "WRONG",
+      "human": "CORRECT",
+      "judge_reasoning": "The generated answer adds the specific unsupported claim that only James has pets, which the gold answer 'No' does not state."
+    },
+    {
+      "item": "14",
+      "run": "s300-naive_rag",
+      "qa_id": "conv-42#q0131",
+      "question": "What does the photo on Joanna's cork board remind her of?",
+      "gold": "love and encouragement from her family",
+      "prediction": "Her family’s love and encouragement every day.",
+      "judge": "WRONG",
+      "human": "CORRECT",
+      "judge_reasoning": "The generated answer adds the frequency claim 'every day,' which is not in the gold answer and is an overreach."
+    },
+    {
+      "item": "15",
+      "run": "s300-hybrid_rag",
+      "qa_id": "conv-41#q0107",
+      "question": "What new activity did Maria start recently, as mentioned on 3 June, 2023?",
+      "gold": "volunteering at a local dog shelter once a month",
+      "prediction": "Volunteering at a local dog shelter.",
+      "judge": "WRONG",
+      "human": "CORRECT",
+      "judge_reasoning": "The generated answer omits the frequency 'once a month' included in the gold answer, so it fails coverage."
+    },
+    {
+      "item": "27",
+      "run": "s300-hybrid_rag",
+      "qa_id": "conv-42#q0170",
+      "question": "Why did Joanna name the stuffed animal dog Tilly?",
+      "gold": "after a dog she had in Michigan",
+      "prediction": "To remember her childhood dog in Michigan.",
+      "judge": "WRONG",
+      "human": "CORRECT",
+      "judge_reasoning": "The generated answer adds the unsupported specific claim that the dog was from her childhood, which the gold answer does not state."
+    },
+    {
+      "item": "28",
+      "run": "s300-hybrid_rag-v3",
+      "qa_id": "conv-49#q0153",
+      "question": "What did Evan share a photo of that was taken on a camping trip?",
+      "gold": "a kayak",
+      "prediction": "A kayak seen from the front of the boat",
+      "judge": "WRONG",
+      "human": "CORRECT",
+      "judge_reasoning": "The generated answer adds the specific detail 'seen from the front of the boat' that the gold answer does not support, which is overreach."
+    },
+    {
+      "item": "33",
+      "run": "s300-full_context",
+      "qa_id": "conv-50#q0133",
+      "question": "Why did Dave start working on cars?",
+      "gold": "Fascinated with how machines work",
+      "prediction": "Fascinated by machines since age ten.",
+      "judge": "WRONG",
+      "human": "CORRECT",
+      "judge_reasoning": "The generated answer adds the specific claim 'since age ten' not supported by the gold answer and omits the nuance 'how machines work'."
+    },
+    {
+      "item": "35",
+      "run": "s300-hybrid_rag-v3",
+      "qa_id": "conv-47#q0010",
+      "question": "When did James adopt Ned?",
+      "gold": "first week of April 2022",
+      "prediction": "The week before 12 April 2022",
+      "judge": "WRONG",
+      "human": "CORRECT",
+      "judge_reasoning": "The week before 12 April 2022 (about April 4-10) is not equivalent to the first week of April 2022."
+    },
+    {
+      "item": "43",
+      "run": "s300-hybrid_rag",
+      "qa_id": "conv-30#q0032",
+      "question": "When did Gina design a limited collection of hoodies?",
+      "gold": "June 2023",
+      "prediction": "The week before 21 June 2023",
+      "judge": "WRONG",
+      "human": "CORRECT",
+      "judge_reasoning": "The generated answer adds a specific week and date that the gold answer's month-level granularity does not support, violating the no-overreach and time-granularity rules."
+    },
+    {
+      "item": "45",
+      "run": "s300-full_context",
+      "qa_id": "conv-41#q0150",
+      "question": "What activities does John's family enjoy doing together?",
+      "gold": "going for hikes, hanging out at the park, having picnics, playing board games, having movie nights",
+      "prediction": "Hiking, park picnics, board games, movie nights.",
+      "judge": "WRONG",
+      "human": "CORRECT",
+      "judge_reasoning": "The generated answer omits 'hanging out at the park' as a distinct family activity, so it does not cover every required item from the gold answer."
+    },
+    {
+      "item": "56",
+      "run": "s300-hybrid_rag",
+      "qa_id": "conv-49#q0000",
+      "question": "What kind of car does Evan drive?",
+      "gold": "Prius",
+      "prediction": "A new Prius",
+      "judge": "WRONG",
+      "human": "CORRECT",
+      "judge_reasoning": "The generated answer adds the unsupported specific claim that the Prius is new, which the gold answer does not state."
+    },
+    {
+      "item": "60",
+      "run": "s300-hybrid_rag-v3",
+      "qa_id": "conv-49#q0090",
+      "question": "What new suggestion did Evan give to Sam regarding his soda and candy consumption?",
+      "gold": "try flavored seltzer water and dark chocolate with high cocoa content",
+      "prediction": "Swap soda for flavored seltzer water; candy for dark chocolate",
+      "judge": "WRONG",
+      "human": "CORRECT",
+      "judge_reasoning": "The generated answer omits the required detail that the dark chocolate should have high cocoa content, so it does not contain every piece of information from the gold answer."
+    },
+    {
+      "item": "63",
+      "run": "s300-hybrid_rag-v3",
+      "qa_id": "conv-26#q0077",
+      "question": "Would Melanie go on another roadtrip soon?",
+      "gold": "Likely no; since this one went badly",
+      "prediction": "Likely no",
+      "judge": "WRONG",
+      "human": "CORRECT",
+      "judge_reasoning": "The generated answer omits the reason 'since this one went badly' that is part of the gold answer."
+    },
+    {
+      "item": "76",
+      "run": "s300-hybrid_rag-v3",
+      "qa_id": "conv-42#q0198",
+      "question": "What did Nate share a photo of as a part of his experimentation in November 2022?",
+      "gold": "colorful bowls of coconut milk ice cream",
+      "prediction": "Homemade coconut ice cream",
+      "judge": "WRONG",
+      "human": "CORRECT",
+      "judge_reasoning": "The generated answer omits the gold answer's 'colorful bowls' detail and adds 'Homemade,' which is not supported by the gold answer."
+    },
+    {
+      "item": "79",
+      "run": "s300-hybrid_rag",
+      "qa_id": "conv-47#q0081",
+      "question": "What inspired James to create the game character in the virtual world?",
+      "gold": "Appearance of a woman he saw during a walk",
+      "prediction": "A stranger he saw while walking his dogs",
+      "judge": "WRONG",
+      "human": "CORRECT",
+      "judge_reasoning": "The generated answer omits that the person was a woman and adds the unsupported detail 'walking his dogs,' so it fails coverage and overreach."
+    },
+    {
+      "item": "81",
+      "run": "s300-full_context",
+      "qa_id": "conv-41#q0126",
+      "question": "What did John take away from visiting the veteran's hospital?",
+      "gold": "appreciation for giving back",
+      "prediction": "To appreciate what we have and give back.",
+      "judge": "WRONG",
+      "human": "CORRECT",
+      "judge_reasoning": "The generated answer adds 'what we have,' which is not in the gold answer, so it overreaches."
+    },
+    {
+      "item": "86",
+      "run": "s300-naive_rag",
+      "qa_id": "conv-50#q0102",
+      "question": "Where did Calvin start shooting a video for his new album?",
+      "gold": "Miami",
+      "prediction": "Miami (on an awesome beach)",
+      "judge": "WRONG",
+      "human": "CORRECT",
+      "judge_reasoning": "The generated answer adds the unsupported specific detail 'on an awesome beach' beyond the gold answer 'Miami', violating the no-overreach rule."
+    },
+    {
+      "item": "91",
+      "run": "s300-hybrid_rag",
+      "qa_id": "conv-26#q0144",
+      "question": "How did Melanie's son handle the accident?",
+      "gold": "He was scared but reassured by his family",
+      "prediction": "He was scared but reassured.",
+      "judge": "WRONG",
+      "human": "CORRECT",
+      "judge_reasoning": "The generated answer omits that he was reassured by his family, which is part of the gold answer."
+    },
+    {
+      "item": "92",
+      "run": "s300-hybrid_rag-v3",
+      "qa_id": "conv-47#q0029",
+      "question": "When did James depart for his trip to Canada?",
+      "gold": "July 11, 2022",
+      "prediction": "Evening of 11 July 2022",
+      "judge": "WRONG",
+      "human": "CORRECT",
+      "judge_reasoning": "The generated answer adds 'Evening', a more specific time claim not present in the gold answer, so it overreaches."
+    },
+    {
+      "item": "93",
+      "run": "s300-full_context",
+      "qa_id": "conv-30#q0022",
+      "question": "When did Gina develop a video presentation to teach how to style her fashion pieces? ",
+      "gold": "June, 2023",
+      "prediction": "13 June 2023",
+      "judge": "WRONG",
+      "human": "CORRECT",
+      "judge_reasoning": "The generated answer adds a specific day (13 June) not supported by the gold answer's June 2023 granularity, which is overreach."
+    },
+    {
+      "item": "99",
+      "run": "s300-hybrid_rag",
+      "qa_id": "conv-47#q0049",
+      "question": "What gaming equipments did John buy or refurbish?",
+      "gold": "Sennheiser headphones, Logitech mouse, gaming desk",
+      "prediction": "New headphones, Logitech mouse, and refurbished gaming desk.",
+      "judge": "WRONG",
+      "human": "CORRECT",
+      "judge_reasoning": "The generated answer says 'new headphones' instead of the required 'Sennheiser headphones', so it misses a specific required item."
+    }
+  ],
+  "unsure_items": []
+}

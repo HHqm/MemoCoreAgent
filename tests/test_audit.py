@@ -66,6 +66,7 @@ class AuditTest(unittest.TestCase):
         rows = read_audit(self.path)
         result = score_audit(self.path, self.settings)
         self.assertEqual((result["labeled"], result["unsure"]), (2, 1))
+        self.assertEqual(result["labelers"], {"human": 3})
         self.assertEqual(result["unsure_items"][0]["note"], "gold looks off")
         judge = [CORRECT if row["qa_id"] == self.qa_ids[0] else WRONG for row in rows[:2]]
         agree = sum(j == h for j, h in zip(judge, (CORRECT, WRONG)))
