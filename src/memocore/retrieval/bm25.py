@@ -43,25 +43,44 @@ def tokenize(text: str) -> list[str]:
 class BM25:
     def __init__(self, documents: Sequence[str], *, k1: float = 1.5, b: float = 0.75):
         self.k1 = k1
+        self.b = b
+        self._size = 0
+        self._lengths = np.zeros(0, dtype=np.float32)
+        self._df: dict[str, int] = {}
+        self._postings: dict[str, list[tuple[int, int]]] = {}
+        self._add(documents)
+
+    def extended(self, documents: Sequence[str]) -> BM25:
+        """A copy with `documents` appended, indexing only those. This index is left untouched, so a
+        search running on it meanwhile is unaffected; scores equal those of an index built in one go."""
+        copy = object.__new__(BM25)
+        copy.__dict__.update(self.__dict__)
+        copy._df, copy._postings = dict(self._df), dict(self._postings)
+        copy._add(documents)
+        return copy
+
+    def _add(self, documents: Sequence[str]) -> None:
         counts = [Counter(tokenize(document)) for document in documents]
-        lengths = np.array([sum(c.values()) for c in counts], dtype=np.float32)
-        average = float(lengths.mean()) if len(lengths) and lengths.mean() > 0 else 1.0
-        self._norm = k1 * (1 - b + b * lengths / average)
-        frequency = Counter(term for c in counts for term in c)
-        n = len(documents)
-        self._idf = {term: math.log(1 + (n - df + 0.5) / (df + 0.5)) for term, df in frequency.items()}
-        self._postings: dict[str, list[tuple[int, int]]] = defaultdict(list)
-        for index, c in enumerate(counts):
+        added: dict[str, list[tuple[int, int]]] = defaultdict(list)
+        for index, c in enumerate(counts, start=self._size):
             for term, tf in c.items():
-                self._postings[term].append((index, tf))
-        self._size = n
+                added[term].append((index, tf))
+        for term, postings in added.items():
+            # A new list rather than an in-place append: the index this one was extended from shares the old one.
+            self._postings[term] = self._postings.get(term, []) + postings
+            self._df[term] = self._df.get(term, 0) + len(postings)
+        self._lengths = np.concatenate([self._lengths, np.array([sum(c.values()) for c in counts], dtype=np.float32)])
+        self._size += len(counts)
+        average = float(self._lengths.mean()) if self._size and self._lengths.mean() > 0 else 1.0
+        self._norm = self.k1 * (1 - self.b + self.b * self._lengths / average)
 
     def scores(self, query: str) -> np.ndarray:
         out = np.zeros(self._size, dtype=np.float32)
         for term in set(tokenize(query)):
-            idf = self._idf.get(term)
-            if idf is None:
+            df = self._df.get(term)
+            if df is None:
                 continue
+            idf = math.log(1 + (self._size - df + 0.5) / (df + 0.5))
             for index, tf in self._postings[term]:
                 out[index] += idf * tf * (self.k1 + 1) / (tf + self._norm[index])
         return out

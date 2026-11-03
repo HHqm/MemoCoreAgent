@@ -96,22 +96,62 @@ class HybridRAGSystem(MemorySystem):
         self._matrix: np.ndarray | None = None
         self._bm25: BM25 | None = None
 
-    def ingest(self, conversation: Conversation) -> None:
-        if self.options.time_anchors:
+    def ingest(self, conversation: Conversation, *, anchored: bool = False) -> None:
+        """Index a conversation. `anchored` means its turns already carry their time notes, as the
+        memory store's turns do (resolved once, at write time)."""
+        if self.options.time_anchors and not anchored:
             conversation = anchor_conversation(conversation)
-        # Conversation order, so sorting indices restores the timeline.
-        self._pairs = [(session, turn) for session in conversation.sessions for turn in session.turns]
-        self._texts = [session.render([turn]) for session, turn in self._pairs]
+        self._pairs, self._texts, self._index_texts, self._rerank_texts, self._spans = [], [], [], [], []
+        self._matrix = None
+        self._bm25 = BM25([]) if self.options.use_bm25 else None
+        self._by_speaker = {}
+        self._append([(session, turn) for session in conversation.sessions for turn in session.turns])
+
+    def extended(self, pairs: Sequence[tuple[Session, Turn]]) -> HybridRAGSystem:
+        """A copy that also holds turns said after everything indexed so far, indexing only those, so
+        a store that keeps growing does not rebuild its whole index after every write. The turns must
+        carry their time notes already. This system is left untouched, so a search running on it
+        meanwhile is unaffected. Rankings equal those of a system that ingested everything at once."""
+        if self.options.context_after:
+            raise ValueError("context_after changes the indexed text of earlier turns; ingest everything again")
+        last = self._pairs[-1][0] if self._pairs else None
+        if pairs and last is not None and pairs[0][0].index < last.index:
+            raise ValueError("extended() only appends turns after the last indexed session")
+        # One Session object per session index, the last indexed one included: rendering and neighbour
+        # lookups tell sessions apart by identity.
+        canonical = {last.index: last} if last is not None else {}
+        pairs = [(canonical.setdefault(session.index, session), turn) for session, turn in pairs]
+        copy = object.__new__(HybridRAGSystem)
+        copy.__dict__.update(self.__dict__)
+        copy._append(pairs)
+        return copy
+
+    def _append(self, pairs: list[tuple[Session, Turn]]) -> None:
+        # Every container is rebound, never changed in place: a system made by extended() shares them
+        # with the one it came from. Conversation order, so sorting indices restores the timeline.
+        start = len(self._pairs)
+        self._pairs = self._pairs + pairs
+        texts = [session.render([turn]) for session, turn in pairs]
         contextual = self.options.context_before or self.options.context_after
-        self._index_texts = [self._in_context(i) for i in range(len(self._pairs))] if contextual else self._texts
-        self._rerank_texts = self._index_texts if self.options.context_in_rerank else self._texts
-        self._matrix = self._embedder.encode(self._index_texts) if self.options.use_dense and self._texts else None
-        self._bm25 = BM25(self._index_texts) if self.options.use_bm25 else None
-        self._spans = [turn_spans(parse_session_date(session.date_time), turn.time_note) for session, turn in self._pairs]
-        speakers = sorted({turn.speaker for _, turn in self._pairs})
+        index_texts = [self._in_context(i) for i in range(start, len(self._pairs))] if contextual else texts
+        self._texts = self._texts + texts
+        self._index_texts = self._index_texts + index_texts
+        self._rerank_texts = self._rerank_texts + (index_texts if self.options.context_in_rerank else texts)
+        if self.options.use_dense and pairs:
+            vectors = self._embedder.encode(index_texts)
+            self._matrix = vectors if self._matrix is None else np.concatenate([self._matrix, vectors])
+        if self._bm25 is not None:
+            self._bm25 = self._bm25.extended(index_texts)
+        dates = {stamp: parse_session_date(stamp) for stamp in {session.date_time for session, _ in pairs}}
+        self._spans = self._spans + [turn_spans(dates[session.date_time], turn.time_note) for session, turn in pairs]
+        speakers = sorted(set(self._by_speaker) | {turn.speaker for _, turn in pairs})
         self._speaker_patterns = {name: re.compile(rf"\b{re.escape(name)}\b") for name in speakers if name}
         self._by_speaker = {
-            name: np.array([turn.speaker == name for _, turn in self._pairs], dtype=np.float32) for name in speakers
+            name: np.concatenate([
+                self._by_speaker.get(name, np.zeros(start, dtype=np.float32)),
+                np.array([turn.speaker == name for _, turn in pairs], dtype=np.float32),
+            ])
+            for name in speakers
         }
 
     def _speaker_prior(self, question: str) -> np.ndarray | None:

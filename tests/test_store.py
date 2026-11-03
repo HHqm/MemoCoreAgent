@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
+from unittest import mock
 
 from memocore.datasets.locomo import load_locomo
 from memocore.embeddings import HashingEmbedder
@@ -83,6 +84,9 @@ class MemoryStoreTest(unittest.TestCase):
                         at=parse_session_time(session.date_time), session=str(session.index),
                     )
                     self.assertEqual(memory.id, turn.dia_id)
+                # A search after every session, so the index the questions below use was grown by
+                # extension rather than built in one go.
+                self.store.search(conversation.sample_id, "anything")
             reference = HybridRAGSystem(embedder, reranker, options=options)
             reference.ingest(conversation)
             for qa in sample.qa:
@@ -91,6 +95,31 @@ class MemoryStoreTest(unittest.TestCase):
                 self.assertEqual({m.id for m in recall.memories}, set(expected), qa.question)
                 self.assertIn(f"[{recall.memories[0].id}] ", recall.context)
         self.assertEqual(self.store.search("someone-else", "anything").memories, ())
+
+    def test_writes_extend_the_index_and_only_forgetting_rebuilds_it(self):
+        builds = []
+        ingest = HybridRAGSystem.ingest
+
+        def counting(system, *args, **kwargs):
+            builds.append(1)
+            return ingest(system, *args, **kwargs)
+
+        questions = ["Where do I live?", "Which instrument?", "What did I eat?"]
+        with mock.patch.object(HybridRAGSystem, "ingest", counting):
+            for text in ("I play the violin", "I live in Denver"):
+                self.store.add("u", text, at=MAY_8)
+            self.store.search("u", "warm up")
+            for text in ("I had ramen for lunch", "Moving to Boston next month"):
+                self.store.add("u", text, at=MAY_8 + timedelta(days=3))  # a new session
+                self.store.search("u", "warm up")
+            self.assertEqual(len(builds), 1)
+            grown = [self.store.search("u", q).context for q in questions]
+            reopened = self._open()  # builds its index in one go
+            self.assertEqual(grown, [reopened.search("u", q).context for q in questions])
+            self.assertEqual(len(builds), 2)
+            self.store.forget("u", ["D2:1"])
+            self.assertNotIn("ramen", self.store.search("u", "What did I eat?").context)
+            self.assertEqual(len(builds), 3)
 
     def test_reopening_reuses_stored_vectors(self):
         self.store.add("u", "I play the violin", at=MAY_8)

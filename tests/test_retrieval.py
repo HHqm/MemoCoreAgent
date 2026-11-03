@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import replace
 
 import numpy as np
 
@@ -8,6 +9,7 @@ from memocore.retrieval.bm25 import BM25, tokenize
 from memocore.retrieval.fusion import rrf, top_indices
 from memocore.retrieval.rerank import LexicalReranker
 from memocore.systems import HybridOptions, HybridRAGSystem, NoMemorySystem, build_system
+from memocore.temporal import anchor_conversation
 from tests.helpers import FIXTURE
 
 
@@ -164,6 +166,40 @@ class HybridSystemTest(unittest.TestCase):
         both = "What did Alice and Bob talk about?"
         self.assertEqual(ranking(both, 10.0), ranking(both, 0.0))  # two names: no prior
         self.assertEqual(sorted(ranking("What did Bob say?", 10.0)), list(range(5)))  # nothing filtered out
+
+    def test_extending_equals_ingesting_everything(self):
+        questions = ["When did Alice adopt Max?", "What instrument is Bob learning?", "Where did Bob live in June 2023?"]
+        for options in (
+            {"fusion": "pool", "rerank_candidates": 5, "feedback_turns": 1, "time_anchors": True,
+             "time_candidates": 3, "speaker_boost": 0.1, "neighbors": 1},
+            {"context_before": 1, "context_in_rerank": True, "rerank_candidates": 5},
+        ):
+            with self.subTest(**options):
+                # extended() takes turns that already carry their time notes, as the store's do.
+                source = anchor_conversation(self.conversation) if options.get("time_anchors") else self.conversation
+                pairs = [(s, t) for s in source.sessions for t in s.turns]
+                whole = self._system(**options)
+                empty = HybridRAGSystem(HashingEmbedder(), LexicalReranker(), top_k=1, options=HybridOptions(**options))
+                empty.ingest(replace(self.conversation, sessions=()))
+                first = empty.extended(pairs[:2])  # ends inside session 1
+                before = first.rank(questions)
+                # Fresh Session objects, as the store loads them: the rest of session 1, then session 2.
+                grown = first.extended([(replace(s), t) for s, t in pairs[2:]])
+                self.assertEqual(grown.rank(questions), whole.rank(questions))
+                self.assertEqual([grown.retrieve(q).text for q in questions], [whole.retrieve(q).text for q in questions])
+                self.assertEqual(first.rank(questions), before)  # the system extended from is untouched
+        with self.assertRaises(ValueError):
+            grown.extended(pairs[:1])  # before the last indexed session
+        with self.assertRaises(ValueError):
+            self._system(context_after=1).extended(pairs[:1])
+
+    def test_extended_bm25_scores_equal_one_built_at_once(self):
+        documents = ["violin lessons today", "lessons about cooking", "nothing related", "violin again", "我在学小提琴"]
+        first = BM25(documents[:2])
+        grown = first.extended(documents[2:])
+        for query in ("violin lessons", "cooking", "小提琴", "absent"):
+            np.testing.assert_array_equal(grown.scores(query), BM25(documents).scores(query))
+        self.assertEqual(len(first.scores("violin")), 2)
 
     def test_invalid_combinations(self):
         with self.assertRaises(ValueError):

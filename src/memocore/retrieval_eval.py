@@ -302,8 +302,10 @@ def memory_replay(
     reranker: Reranker | None = None,
     progress: bool = True,
 ) -> dict[str, Any]:
-    """Write LoCoMo into a MemoryStore one message at a time, then check every question retrieves
-    exactly the turns the evaluated HybridRAGSystem picks. No LLM calls."""
+    """Write LoCoMo into a MemoryStore one message at a time, recalling after every session as an
+    agent would, then check every question retrieves exactly the turns the evaluated HybridRAGSystem
+    picks. The recalls between sessions mean the questions run on an index grown write by write
+    (MemoryStore extends it rather than rebuilding). No LLM calls."""
     from memocore.store import DEFAULT_OPTIONS, MemoryStore, parse_session_time
 
     selected = select_questions(
@@ -313,7 +315,7 @@ def memory_replay(
     embedder = embedder or build_embedder(settings)
     reranker = reranker or build_reranker(settings)
     recalls: dict[int, list[float]] = defaultdict(list)
-    identical = turns = 0
+    identical = turns = sessions = 0
     add_s = search_s = 0.0
     mismatched: list[str] = []
     with tempfile.TemporaryDirectory() as tmp:
@@ -321,9 +323,9 @@ def memory_replay(
         store = MemoryStore(path, embedder, reranker, budget=budget)
         for sample, questions in tqdm(selected, desc="memory-replay", disable=not progress):
             conversation = sample.conversation
-            start = time.perf_counter()
             for session in conversation.sessions:
                 at = parse_session_time(session.date_time)
+                start = time.perf_counter()
                 for turn in session.turns:
                     memory = store.add(
                         conversation.sample_id, turn.text, speaker=turn.speaker, at=at,
@@ -332,7 +334,9 @@ def memory_replay(
                     if memory.id != turn.dia_id:
                         raise AssertionError(f"store numbered {turn.dia_id} as {memory.id}")
                     turns += 1
-            add_s += time.perf_counter() - start
+                add_s += time.perf_counter() - start
+                store.search(conversation.sample_id, session.turns[-1].text)
+                sessions += 1
 
             reference = HybridRAGSystem(embedder, reranker, top_k=budget, options=DEFAULT_OPTIONS)
             reference.ingest(conversation)
@@ -358,6 +362,7 @@ def memory_replay(
         "reranker_model": reranker.name,
         "budget": budget,
         "turns": turns,
+        "sessions_recalled_after": sessions,
         "questions": questions,
         "identical_to_evaluated_system": identical,
         "mismatched": mismatched[:20],

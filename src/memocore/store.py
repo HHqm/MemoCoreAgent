@@ -18,7 +18,7 @@ import threading
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Iterable, NamedTuple, Sequence
 
 import numpy as np
 
@@ -63,7 +63,8 @@ CREATE TABLE IF NOT EXISTS turns (
 );
 CREATE TABLE IF NOT EXISTS revisions (
     user TEXT PRIMARY KEY,
-    revision INTEGER NOT NULL
+    revision INTEGER NOT NULL,  -- bumped by every write
+    forgets INTEGER NOT NULL DEFAULT 0  -- bumped by deletions only; between two of them, writes only append
 );
 """
 _TURN_ID = re.compile(r"^D(\d+):(\d+)$")
@@ -131,11 +132,22 @@ class _StoredVectors:
         self.name = inner.name
         self._vectors = vectors
 
+    def add(self, vectors: dict[str, np.ndarray]) -> None:
+        self._vectors.update(vectors)
+
     def encode(self, texts: Sequence[str]) -> np.ndarray:
         keys = [_vector_key(text) for text in texts]
         missing = {key: text for key, text in zip(keys, texts) if key not in self._vectors}
         fresh = dict(zip(missing, self.inner.encode(list(missing.values())))) if missing else {}
         return np.stack([self._vectors.get(key, fresh.get(key)) for key in keys])
+
+
+class _Index(NamedTuple):
+    revision: int
+    forgets: int
+    last: tuple[int, int]  # (session, position) of the newest turn indexed
+    system: HybridRAGSystem
+    vectors: _StoredVectors
 
 
 class MemoryStore:
@@ -163,8 +175,10 @@ class MemoryStore:
         self._db.executescript(_SCHEMA)
         if "vector_key" not in {row[1] for row in self._db.execute("PRAGMA table_info(turns)")}:
             self._db.execute("ALTER TABLE turns ADD COLUMN vector_key TEXT")  # stores created before the column
+        if "forgets" not in {row[1] for row in self._db.execute("PRAGMA table_info(revisions)")}:
+            self._db.execute("ALTER TABLE revisions ADD COLUMN forgets INTEGER NOT NULL DEFAULT 0")
         self._lock = threading.Lock()
-        self._systems: dict[str, tuple[int, HybridRAGSystem]] = {}
+        self._indexes: dict[str, _Index] = {}
 
     def close(self) -> None:
         self._db.close()
@@ -243,9 +257,11 @@ class MemoryStore:
         )
         return number, at
 
-    def _bump(self, user: str) -> None:
+    def _bump(self, user: str, *, forgot: bool = False) -> None:
         self._db.execute(
-            "INSERT INTO revisions VALUES (?, 1) ON CONFLICT(user) DO UPDATE SET revision = revision + 1", (user,)
+            "INSERT INTO revisions VALUES (?, 1, ?) ON CONFLICT(user) DO UPDATE SET revision = revision + 1, "
+            "forgets = forgets + excluded.forgets",
+            (user, int(forgot)),
         )
 
     def forget(self, user: str, ids: Sequence[str] | None = None) -> int:
@@ -262,8 +278,8 @@ class MemoryStore:
                     ).rowcount
                     for key in keys
                 )
-            self._bump(user)
-            self._systems.pop(user, None)
+            self._bump(user, forgot=True)
+            self._indexes.pop(user, None)
         return deleted
 
     # --- reading -------------------------------------------------------------------------------
@@ -300,35 +316,53 @@ class MemoryStore:
             return self._db.execute("SELECT count(*) FROM turns WHERE user = ?", (user,)).fetchone()[0]
 
     def _system(self, user: str) -> HybridRAGSystem | None:
-        row = self._db.execute("SELECT revision FROM revisions WHERE user = ?", (user,)).fetchone()
-        revision = row[0] if row else 0
-        cached = self._systems.get(user)
-        if cached and cached[0] == revision:
-            return cached[1]
-        rows = self._db.execute(
-            "SELECT s.number, s.started_at, t.position, t.speaker, t.text, t.image, t.embedding_model, t.vector, "
-            "t.vector_key FROM turns t JOIN sessions s ON s.user = t.user AND s.number = t.session "
-            "WHERE t.user = ? ORDER BY t.session, t.position",
-            (user,),
-        ).fetchall()
-        if not rows:
+        row = self._db.execute("SELECT revision, forgets FROM revisions WHERE user = ?", (user,)).fetchone()
+        revision, forgets = row if row else (0, 0)
+        cached = self._indexes.get(user)
+        if cached and cached.revision == revision:
+            return cached.system
+        if cached and cached.forgets == forgets:
+            # Nothing was deleted since the index was built, so the writes since then only appended
+            # turns: index just those. A search still running on the old index is unaffected.
+            sessions, vectors, last = self._load(user, after=cached.last)
+            cached.vectors.add(vectors)
+            pairs = [(session, turn) for session in sessions for turn in session.turns]
+            system = cached.system.extended(pairs) if pairs else cached.system
+            self._indexes[user] = _Index(revision, forgets, last or cached.last, system, cached.vectors)
+            return system
+        sessions, vectors, last = self._load(user)
+        if not sessions:
+            self._indexes.pop(user, None)
             return None
+        # A vector saved under another embedding model is re-encoded rather than mixed in.
+        stored = _StoredVectors(self.embedder, vectors)
+        system = HybridRAGSystem(stored, self.reranker, options=self.options)
+        system.cite = True
+        system.ingest(Conversation(user, "", "", tuple(sessions)), anchored=True)
+        self._indexes[user] = _Index(revision, forgets, last, system, stored)
+        return system
+
+    def _load(
+        self, user: str, after: tuple[int, int] = (0, 0)
+    ) -> tuple[list[Session], dict[str, np.ndarray], tuple[int, int] | None]:
+        """The user's turns after (session, position) `after`, grouped into sessions, with their stored vectors."""
+        rows = self._db.execute(
+            "SELECT s.number, s.started_at, t.position, t.speaker, t.text, t.image, t.time_note, t.embedding_model, "
+            "t.vector, t.vector_key FROM turns t JOIN sessions s ON s.user = t.user AND s.number = t.session "
+            "WHERE t.user = ? AND (t.session, t.position) > (?, ?) ORDER BY t.session, t.position",
+            (user, *after),
+        ).fetchall()
         sessions: dict[int, tuple[str, list[Turn]]] = {}
         vectors: dict[str, np.ndarray] = {}
-        for number, started_at, position, speaker, text, image, model, blob, key in rows:
+        for number, started_at, position, speaker, text, image, note, model, blob, key in rows:
             stamp = format_session_time(datetime.fromisoformat(started_at))
-            sessions.setdefault(number, (stamp, []))[1].append(Turn(f"D{number}:{position}", speaker, text, image))
+            # The note resolved at write time, the one the stored vector was computed with.
+            note = note if self.options.time_anchors else None
+            sessions.setdefault(number, (stamp, []))[1].append(Turn(f"D{number}:{position}", speaker, text, image, note))
             if model == self.embedder.name and key:
                 vectors[key] = np.frombuffer(blob, dtype=np.float32)
-        conversation = Conversation(
-            user, "", "", tuple(Session(number, stamp, tuple(turns)) for number, (stamp, turns) in sessions.items())
-        )
-        # A vector saved under another embedding model is re-encoded rather than mixed in.
-        system = HybridRAGSystem(_StoredVectors(self.embedder, vectors), self.reranker, options=self.options)
-        system.cite = True
-        system.ingest(conversation)
-        self._systems[user] = (revision, system)
-        return system
+        last = (rows[-1][0], rows[-1][2]) if rows else None
+        return [Session(number, stamp, tuple(turns)) for number, (stamp, turns) in sessions.items()], vectors, last
 
 
 def _parse_id(turn_id: str) -> tuple[int, int]:

@@ -3,6 +3,7 @@
   "reranker_model": "D:\\prru\\memocore\\models\\bge-reranker-v2-m3",
   "budget": 20,
   "turns": 5882,
+  "sessions_recalled_after": 272,
   "questions": 1540,
   "identical_to_evaluated_system": 1540,
   "mismatched": [],
@@ -14,7 +15,7 @@
     "open-domain": 0.6323529411764707,
     "single-hop": 0.9449068569163693
   },
-  "add_ms_per_turn": 8.14,
-  "search_ms_per_question": 3.4,
+  "add_ms_per_turn": 7.68,
+  "search_ms_per_question": 3.07,
   "db_bytes": 27312128
 }
