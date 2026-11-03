@@ -138,7 +138,9 @@ class MemoryStoreTest(unittest.TestCase):
 
         def call(name, **arguments):
             result = asyncio.run(server.call_tool(name, arguments))
-            content = result[0] if isinstance(result, tuple) else result
+            content = getattr(result, "content", None)  # mcp 2.x returns a CallToolResult
+            if content is None:  # mcp 1.x: the content list, or (content, structured output)
+                content = result[0] if isinstance(result, tuple) else result
             return content[0].text
 
         names = {tool.name for tool in asyncio.run(server.list_tools())}

@@ -7,7 +7,10 @@ purpose, so an agent cannot erase everything with one tool call.
 
 from __future__ import annotations
 
-from mcp.server.fastmcp import FastMCP
+try:  # mcp 2.x renamed FastMCP to MCPServer; the parts used here work the same in both
+    from mcp.server.mcpserver import MCPServer
+except ImportError:  # mcp 1.x
+    from mcp.server.fastmcp import FastMCP as MCPServer
 
 from memocore.store import Memory, MemoryStore
 
@@ -28,8 +31,8 @@ def _line(memory: Memory) -> str:
     return line
 
 
-def build_server(store: MemoryStore, user: str) -> FastMCP:
-    server = FastMCP("memocore", instructions=INSTRUCTIONS, log_level="WARNING")
+def build_server(store: MemoryStore, user: str) -> MCPServer:
+    server = MCPServer("memocore", instructions=INSTRUCTIONS, log_level="WARNING")
 
     @server.tool()
     def remember(text: str, speaker: str = "user", session: str = "") -> str:
