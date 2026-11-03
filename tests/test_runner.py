@@ -1,4 +1,3 @@
-import csv
 import json
 import unittest
 
@@ -9,11 +8,9 @@ from memocore.runner import (
     PREDICTIONS,
     RunConfig,
     RunMismatchError,
-    export_audit,
     judge_path,
     run_judge,
     run_predictions,
-    score_audit,
     select_questions,
     summarize,
 )
@@ -89,7 +86,7 @@ class RunnerTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             select_questions(samples, RunConfig(system="full_context", run_name="x", qa_ids=("conv-test#q9999",)))
 
-    def test_judge_summary_and_audit(self):
+    def test_judge_summary(self):
         self._run()
         run_judge("t", "strict", self.settings, progress=False)
         run_judge("t", "strict", self.settings, progress=False)  # resumes: no duplicates
@@ -102,22 +99,6 @@ class RunnerTest(unittest.TestCase):
         self.assertIn("adversarial", summary["groups"])
         markdown = (self.settings.runs_dir / "t" / "summary.md").read_text(encoding="utf-8")
         self.assertIn("--mock", markdown)
-
-        path = export_audit("t", "strict", self.settings, n=3)
-        with self.assertRaises(FileExistsError):
-            export_audit("t", "strict", self.settings, n=3)
-        with path.open(encoding="utf-8-sig", newline="") as handle:
-            rows = list(csv.DictReader(handle))
-        self.assertEqual(len(rows), 3)
-        rows[0]["human_label"] = rows[0]["judge_label"]
-        rows[1]["human_label"] = "对" if rows[1]["judge_label"] == "WRONG" else "错"
-        with path.open("w", encoding="utf-8-sig", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
-            writer.writeheader()
-            writer.writerows(rows)
-        result = score_audit(path)
-        self.assertEqual(result["labeled"], 2)
-        self.assertAlmostEqual(result["agreement"], 0.5)
 
     def test_full_context_run_records_whole_conversation(self):
         cfg = RunConfig(system="full_context", run_name="fc", categories=(4,), mock=True)

@@ -5,6 +5,7 @@ import json
 import sys
 from pathlib import Path
 
+from memocore.audit import export_audit, label_audit, score_audit
 from memocore.config import Settings
 from memocore.datasets.locomo import CATEGORY_NAMES, DEFAULT_CATEGORIES, LOCOMO_URL, load_locomo
 from memocore.judge import JUDGE_KINDS
@@ -13,10 +14,8 @@ from memocore.runner import (
     SUMMARY_MD,
     RunConfig,
     RunMismatchError,
-    export_audit,
     run_judge,
     run_predictions,
-    score_audit,
     summarize,
 )
 from memocore.systems import SYSTEM_NAMES
@@ -81,13 +80,18 @@ def build_parser() -> argparse.ArgumentParser:
     report = sub.add_parser("report", help="重新生成汇总表")
     report.add_argument("--run-name", required=True)
 
-    audit = sub.add_parser("audit-export", help="抽样导出裁判结果，供人工标注")
-    audit.add_argument("--run-name", required=True)
+    audit = sub.add_parser("audit-export", help="盲抽样导出裁判过的回答供人工标注，表里不显示裁判结论和系统名")
+    audit.add_argument("--run-name", nargs="+", required=True, help="可给多个运行：题目不重复，各运行轮流分配")
     audit.add_argument("--kind", choices=JUDGE_KINDS, default="strict")
     audit.add_argument("--n", type=int, default=100)
     audit.add_argument("--seed", type=int, default=0)
+    audit.add_argument("--include-rule", action="store_true", help="也抽规则直接判定的题（默认跳过：它们按构造就是对的）")
+    audit.add_argument("--out", type=Path, help="默认 runs/audit_<kind>.csv")
 
-    agreement = sub.add_parser("audit-score", help="计算人工标注与裁判的一致率")
+    label = sub.add_parser("audit-label", help="在终端里逐题标注，每标一题就保存，可随时退出再续")
+    label.add_argument("--csv", type=Path, required=True)
+
+    agreement = sub.add_parser("audit-score", help="把人工标注和裁判结论对上，计算一致率、kappa 和裁判偏严还是偏松")
     agreement.add_argument("--csv", type=Path, required=True)
 
     sweep = sub.add_parser("retrieval-sweep", help="只量朴素 RAG 的证据召回，不调用 LLM、不花钱")
@@ -103,6 +107,16 @@ def build_parser() -> argparse.ArgumentParser:
     ablation = sub.add_parser("retrieval-ablation", help="同一预算下逐个组件比较读取路径的证据召回，不调用 LLM")
     ablation.add_argument("--budgets", type=_int_list, default=(5, 10, 20))
     ablation.add_argument("--categories", type=_int_list, default=DEFAULT_CATEGORIES)
+
+    replay = sub.add_parser(
+        "memory-replay", help="把 LoCoMo 逐条写入 MemoryStore 再检索，核对与评测过的检索路径逐题一致，不调用 LLM"
+    )
+    replay.add_argument("--budget", type=int, default=20)
+
+    serve = sub.add_parser("mcp", help="启动 MCP 服务（stdio），让 Claude Code 等 Agent 读写长期记忆")
+    serve.add_argument("--user", default="default", help="记忆归属的用户；不同用户的记忆互相隔离")
+    serve.add_argument("--db", type=Path, help="记忆库文件，默认 data/memory.sqlite")
+    serve.add_argument("--offline", action="store_true", help="用哈希向量和字面重排代替模型，只用来试流程")
     return parser
 
 
@@ -172,10 +186,15 @@ def _dispatch(args: argparse.Namespace, settings: Settings) -> int:
     elif args.command == "report":
         _report(settings, args.run_name)
     elif args.command == "audit-export":
-        path = export_audit(args.run_name, args.kind, settings, n=args.n, seed=args.seed)
-        print(f"已导出 {path}：在 human_label 列填 CORRECT / WRONG（或 对 / 错），再运行 memocore audit-score --csv {path}")
+        path = export_audit(
+            args.run_name, args.kind, settings, n=args.n, seed=args.seed, include_rule=args.include_rule, out=args.out
+        )
+        print(f"已导出 {path}。逐题标注：memocore audit-label --csv {path}"
+              f"（也可以直接在 human_label 列填 对 / 错 / ?），标完运行 memocore audit-score --csv {path}")
+    elif args.command == "audit-label":
+        label_audit(args.csv)
     elif args.command == "audit-score":
-        print(json.dumps(score_audit(args.csv), ensure_ascii=False, indent=2))
+        print(json.dumps(score_audit(args.csv, settings), ensure_ascii=False, indent=2))
     elif args.command == "retrieval-sweep":
         from memocore.retrieval_eval import render_sweep, retrieval_sweep
 
@@ -191,7 +210,33 @@ def _dispatch(args: argparse.Namespace, settings: Settings) -> int:
         from memocore.retrieval_eval import render_ablation, retrieval_ablation
 
         print(render_ablation(retrieval_ablation(settings, budgets=args.budgets, categories=args.categories)))
+    elif args.command == "memory-replay":
+        from memocore.retrieval_eval import memory_replay
+
+        print(json.dumps(memory_replay(settings, budget=args.budget), ensure_ascii=False, indent=2))
+    elif args.command == "mcp":
+        _serve(settings, args)
     return 0
+
+
+def _serve(settings: Settings, args: argparse.Namespace) -> None:
+    from memocore.mcp_server import build_server
+    from memocore.store import MemoryStore
+
+    if args.offline:
+        from memocore.embeddings import HashingEmbedder
+        from memocore.retrieval.rerank import LexicalReranker
+
+        embedder, reranker = HashingEmbedder(), LexicalReranker()
+    else:
+        from memocore.embeddings import SentenceTransformerEmbedder
+        from memocore.retrieval.rerank import CrossEncoderReranker
+
+        # No disk caches here: the store keeps its own vectors, so forgetting a message leaves nothing behind.
+        embedder = SentenceTransformerEmbedder(settings.embedding_model, device=settings.embedding_device)
+        reranker = CrossEncoderReranker(settings.reranker_model, device=settings.embedding_device)
+    store = MemoryStore(args.db or settings.data_dir / "memory.sqlite", embedder, reranker)
+    build_server(store, args.user).run("stdio")
 
 
 if __name__ == "__main__":

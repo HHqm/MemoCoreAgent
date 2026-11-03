@@ -7,8 +7,10 @@ later separates "the memory never surfaced the fact" from "the model failed to u
 from __future__ import annotations
 
 import json
+import tempfile
 import time
 from collections import defaultdict
+from pathlib import Path
 from statistics import fmean
 from typing import Any, Sequence
 
@@ -280,3 +282,84 @@ def render_sweep(result: dict[str, Any]) -> str:
         f"每块 {t['chunk_turns']} 轮时建索引共 {t['ingest_s']} s、单次检索 {t['query_ms']} ms" for t in result["timing"]
     )]
     return "\n".join(lines) + "\n"
+
+
+REPLAY_JSON = "memory_replay.json"
+
+
+def memory_replay(
+    settings: Settings,
+    *,
+    budget: int = 20,
+    categories: Sequence[int] = DEFAULT_CATEGORIES,
+    embedder: Embedder | None = None,
+    reranker: Reranker | None = None,
+    progress: bool = True,
+) -> dict[str, Any]:
+    """Write LoCoMo into a MemoryStore one message at a time, then check every question retrieves
+    exactly the turns the evaluated HybridRAGSystem picks. No LLM calls."""
+    from memocore.store import DEFAULT_OPTIONS, MemoryStore, parse_session_time
+
+    selected = select_questions(
+        load_locomo(settings.locomo_path),
+        RunConfig(system="hybrid_rag", run_name="memory-replay", categories=tuple(categories)),
+    )
+    embedder = embedder or build_embedder(settings)
+    reranker = reranker or build_reranker(settings)
+    recalls: dict[int, list[float]] = defaultdict(list)
+    identical = turns = 0
+    add_s = search_s = 0.0
+    mismatched: list[str] = []
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "replay.sqlite"
+        store = MemoryStore(path, embedder, reranker, budget=budget)
+        for sample, questions in tqdm(selected, desc="memory-replay", disable=not progress):
+            conversation = sample.conversation
+            start = time.perf_counter()
+            for session in conversation.sessions:
+                at = parse_session_time(session.date_time)
+                for turn in session.turns:
+                    memory = store.add(
+                        conversation.sample_id, turn.text, speaker=turn.speaker, at=at,
+                        session=f"locomo-{session.index}", image=turn.image_caption,
+                    )
+                    if memory.id != turn.dia_id:
+                        raise AssertionError(f"store numbered {turn.dia_id} as {memory.id}")
+                    turns += 1
+            add_s += time.perf_counter() - start
+
+            reference = HybridRAGSystem(embedder, reranker, top_k=budget, options=DEFAULT_OPTIONS)
+            reference.ingest(conversation)
+            rankings = reference.rank([qa.question for qa in questions])
+            for qa, ranked in zip(questions, rankings):
+                expected = set(reference.turn_ids(reference.select(ranked, budget)))
+                start = time.perf_counter()
+                got = [memory.id for memory in store.search(conversation.sample_id, qa.question).memories]
+                search_s += time.perf_counter() - start
+                if set(got) == expected:
+                    identical += 1
+                else:
+                    mismatched.append(qa.qa_id)
+                recall = evidence_recall(qa.evidence, got)
+                if recall is not None:
+                    recalls[qa.category].append(recall)
+        db_bytes = path.stat().st_size
+        store.close()
+
+    questions = sum(len(qs) for _, qs in selected)
+    result = {
+        "embedding_model": embedder.name,
+        "reranker_model": reranker.name,
+        "budget": budget,
+        "turns": turns,
+        "questions": questions,
+        "identical_to_evaluated_system": identical,
+        "mismatched": mismatched[:20],
+        **_recall_stats(recalls),
+        "add_ms_per_turn": round(1000 * add_s / max(turns, 1), 2),
+        "search_ms_per_question": round(1000 * search_s / max(questions, 1), 2),
+        "db_bytes": db_bytes,
+    }
+    settings.runs_dir.mkdir(parents=True, exist_ok=True)
+    (settings.runs_dir / REPLAY_JSON).write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    return result

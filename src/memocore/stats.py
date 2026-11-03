@@ -45,3 +45,26 @@ def paired_bootstrap(
     # Two-sided: how often a resample lands on the other side of zero.
     result["p_value"] = float(min(1.0, 2 * min((means <= 0).mean(), (means >= 0).mean())))
     return result
+
+
+def wilson_ci(successes: int, n: int, *, z: float = 1.96) -> tuple[float, float] | None:
+    """Interval for a proportion that stays inside [0, 1] even when it is near 0 or 1, as agreement rates are."""
+    if n == 0:
+        return None
+    p = successes / n
+    centre = (p + z * z / (2 * n)) / (1 + z * z / n)
+    half = z * np.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / (1 + z * z / n)
+    return float(centre - half), float(centre + half)
+
+
+def cohen_kappa(pairs: Sequence[tuple[str, str]]) -> float | None:
+    """Agreement between two raters beyond what their label frequencies alone would produce by chance."""
+    if not pairs:
+        return None
+    n = len(pairs)
+    observed = sum(a == b for a, b in pairs) / n
+    labels = {label for pair in pairs for label in pair}
+    expected = sum(
+        (sum(a == label for a, _ in pairs) / n) * (sum(b == label for _, b in pairs) / n) for label in labels
+    )
+    return None if expected == 1 else (observed - expected) / (1 - expected)

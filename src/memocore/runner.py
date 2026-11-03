@@ -6,7 +6,6 @@ response cache, so an interrupted run resumes where it stopped without paying tw
 
 from __future__ import annotations
 
-import csv
 import json
 import random
 import sys
@@ -524,55 +523,3 @@ def existing_run(settings: Settings, run_name: str) -> Path:
     if not (run_dir / RUN_INFO).exists():
         raise FileNotFoundError(f"找不到运行 {run_name!r}（{run_dir}），请先执行 memocore run。")
     return run_dir
-
-
-AUDIT_FIELDS = ["qa_id", "category", "question", "gold", "prediction", "judge_label", "human_label"]
-_HUMAN_LABELS = {
-    "correct": "CORRECT", "c": "CORRECT", "1": "CORRECT", "y": "CORRECT", "yes": "CORRECT", "对": "CORRECT",
-    "wrong": "WRONG", "w": "WRONG", "0": "WRONG", "n": "WRONG", "no": "WRONG", "错": "WRONG",
-}
-
-
-def export_audit(run_name: str, kind: str, settings: Settings, *, n: int = 100, seed: int = 0) -> Path:
-    """Write a random sample of judged answers to CSV for a human to label in the human_label column."""
-    run_dir = existing_run(settings, run_name)
-    verdicts = list(read_jsonl(judge_path(run_dir, kind)))
-    if not verdicts:
-        raise FileNotFoundError(f"运行 {run_name!r} 还没有 {kind} 裁判结果，请先执行 memocore judge。")
-    path = run_dir / f"audit_{kind}.csv"
-    if path.exists():
-        # Never overwrite a file that may already hold hand-written labels.
-        raise FileExistsError(f"{path} 已存在；如需重新抽样请先手动改名或删除。")
-    predictions = {row["qa_id"]: row for row in read_jsonl(run_dir / PREDICTIONS)}
-    chosen = random.Random(seed).sample(verdicts, min(n, len(verdicts)))
-    with path.open("w", encoding="utf-8-sig", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=AUDIT_FIELDS)
-        writer.writeheader()
-        for verdict in chosen:
-            row = predictions[verdict["qa_id"]]
-            writer.writerow(
-                {
-                    "qa_id": row["qa_id"],
-                    "category": row["category_name"],
-                    "question": row["question"],
-                    "gold": row["gold"],
-                    "prediction": row["prediction"],
-                    "judge_label": verdict["label"] or "",
-                    "human_label": "",
-                }
-            )
-    return path
-
-
-def score_audit(csv_path: Path) -> dict[str, Any]:
-    with Path(csv_path).open(encoding="utf-8-sig", newline="") as handle:
-        rows = list(csv.DictReader(handle))
-    pairs = [(row["judge_label"], _HUMAN_LABELS.get(row["human_label"].strip().lower())) for row in rows]
-    labeled = [(judge, human) for judge, human in pairs if human]
-    agree = sum(judge == human for judge, human in labeled)
-    return {
-        "total": len(rows),
-        "labeled": len(labeled),
-        "agreement": agree / len(labeled) if labeled else None,
-        "confusion": dict(Counter(f"judge={judge or 'UNPARSED'} / human={human}" for judge, human in labeled)),
-    }

@@ -1,0 +1,20 @@
+{
+  "embedding_model": "D:\\prru\\memocore\\models\\bge-m3",
+  "reranker_model": "D:\\prru\\memocore\\models\\bge-reranker-v2-m3",
+  "budget": 20,
+  "turns": 5882,
+  "questions": 1540,
+  "identical_to_evaluated_system": 1540,
+  "mismatched": [],
+  "recall": 0.8752818220402694,
+  "all_evidence_rate": 0.8190104166666666,
+  "by_category": {
+    "multi-hop": 0.7387934092161416,
+    "temporal": 0.911993769470405,
+    "open-domain": 0.6160485933503836,
+    "single-hop": 0.9353943717796274
+  },
+  "add_ms_per_turn": 8.24,
+  "search_ms_per_question": 3.44,
+  "db_bytes": 27299840
+}

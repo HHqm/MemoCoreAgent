@@ -12,6 +12,7 @@
 - **写入不调用 LLM**：向量编码 + BM25 索引 + 规则时间锚定。
 - **读取靠精排**：bge-m3 召回，BM25 补充候选，伪相关反馈做第二跳，bge-reranker 重排。
 - **答案带出处**：回答必须引用原文轮次编号，无法引用的内容不许写；引用可以直接回原文核对。
+- **能直接接入 Agent**：持久化记忆库加 MCP 服务，Claude Code 一条命令就能用；用的是评测过的同一条读取路径，逐条回放 LoCoMo 后 1,540 题检索结果全部一致。
 - **每个改动都要在同一预算下用数字证明**。
 
 详见 [与高星项目的对比](docs/COMPARISON.md) 和 [评测方法](docs/EVALUATION.md)。
@@ -76,7 +77,66 @@
 | 作答 | 所有系统共用一份回答 prompt（`--prompt v1/v2/v3`）；默认 v3 要求答案引用原文轮次，引用会被剥离后再评分，并对照标注证据计算引用精确率和召回；思考模型撞到输出上限时自动加倍重试一次 |
 | 指标 | 与官方口径一致的 token F1；严格、宽松两套 LLM 裁判；证据召回；答案可见率；token、前缀缓存命中、延迟 |
 | 统计 | bootstrap 95% 置信区间；`compare` 按题配对比较两个运行，给出差值区间和 p 值；人工抽检裁判一致率 |
-| 工程 | 断点续跑；LLM 响应、向量、重排分数全部按内容寻址缓存；设置不一致拒绝续跑；`--qa-ids` 定向抽查；`--mock` 离线全流程；GPU 半精度与批量编码；GitHub Actions 跑 61 个离线测试，已发布结果用到的 prompt 哈希被测试锁定 |
+| 接入 | `MemoryStore`（SQLite 持久化、多用户隔离、按编号取原文、彻底删除）和 MCP 服务（remember / recall / read_memories / forget），读取路径与评测完全一致 |
+| 工程 | 断点续跑；LLM 响应、向量、重排分数全部按内容寻址缓存；设置不一致拒绝续跑；`--qa-ids` 定向抽查；`--mock` 离线全流程；GPU 半精度与批量编码；GitHub Actions 跑 70 个离线测试，已发布结果用到的 prompt 哈希被测试锁定 |
+
+## 接入 Agent：MCP 服务与 Python 库
+
+评测用的读取路径就是实际使用的那条：`MemoryStore` 把每条消息原样存进 SQLite，读取时在存好的轮次上构建同一个 `HybridRAGSystem`。
+
+**接入 Claude Code**（其他支持 MCP 的客户端同理）：
+
+```bash
+claude mcp add memocore -- D:\envs\timeseries\Scripts\memocore.exe mcp --user me
+```
+
+服务提供四个工具：
+
+| 工具 | 作用 |
+|---|---|
+| `remember` | 原样存一条消息，写入时完成时间锚定和向量编码，返回可引用的编号（如 `[D3:12]`） |
+| `recall` | 按问题取回最相关的若干条，按时间顺序带编号和日期返回，可以直接放进 prompt |
+| `read_memories` | 按编号取回原文，用来核对回答里的引用 |
+| `forget` | 按编号永久删除，连同时间注释和向量一起删；清空整个用户只能通过库或命令行，Agent 不能一键全删 |
+
+**作为 Python 库**：
+
+```python
+from memocore.config import Settings
+from memocore.embeddings import SentenceTransformerEmbedder
+from memocore.retrieval.rerank import CrossEncoderReranker
+from memocore.store import MemoryStore
+
+settings = Settings.from_env()
+store = MemoryStore(
+    "memory.sqlite",
+    SentenceTransformerEmbedder(settings.embedding_model),
+    CrossEncoderReranker(settings.reranker_model),
+)
+store.add("alice", "I adopted a beagle named Max yesterday")  # -> Memory(id="D1:1", time_note="time: yesterday = ...")
+recall = store.search("alice", "What is my dog called?")      # recall.context 可直接放进回答 prompt
+store.get("alice", ["D1:1"])                                  # 按引用编号取回原文
+store.forget("alice")                                         # 删除这个用户的全部记忆
+```
+
+- **一条消息一行**：原文、时间注释、向量存在同一行，同一个事务写入；删除时一起删，并开启 SQLite `secure_delete` 覆写被删内容。测试会直接扫描数据库文件，确认被删的原文已经不在。
+- **编号永不复用**：删掉的编号不会再分配给新消息，旧回答里的引用不会指向别的内容。
+- **会话自动切分**：调用方可以传会话键；不传时，与上一条间隔超过 30 分钟就开新会话。时间锚定按会话日期换算。
+- **多用户隔离**：每个用户的记忆分开存、分开建索引。
+- **读写一致**：每次写入或删除都会让该用户的索引失效，下一次检索时重建；向量直接从库里读，不重新编码。
+
+**逐条回放核对**（`memocore memory-replay`，不调用 LLM）：把 LoCoMo 的 5,882 轮对话一条一条写进记忆库，再用 1,540 道题检索。
+
+| 指标 | 结果 |
+|---|---|
+| 和评测过的 `HybridRAGSystem` 选出的轮次逐题一致 | **1,540 / 1,540** |
+| 20 轮预算的证据召回 | 87.5%（与检索消融的默认配置一致，小数点后全部相同） |
+| 写入一条消息（中位数 / p95，含向量编码和落盘） | 26 ms / 42 ms |
+| 检索一次（中位数 / p95，主要是 bge-reranker 重排） | 295 ms / 330 ms |
+| 写入后的第一次检索（含重建 419 轮的索引） | 315 ms |
+| 库文件大小（5,882 轮，含 1024 维向量） | 27 MB |
+
+延迟是在 RTX 5060 笔记本上、关闭所有缓存，用一段 419 轮的对话测的。
 
 ## 快速开始
 
@@ -145,17 +205,19 @@ memocore compare --baseline s300-naive_rag --candidate s300-hybrid_rag
 memocore run --system hybrid_rag --run-name probe --qa-ids "conv-26#q0019,conv-30#q0060" --judge none
 ```
 
-### 4. 抽检裁判
+### 4. 抽检裁判（盲标）
 
 ```bash
-memocore audit-export --run-name hybrid --kind strict --n 100
+memocore audit-export --run-name s300-full_context s300-naive_rag s300-hybrid_rag s300-hybrid_rag-v3 --n 100
+memocore audit-label --csv runs/audit_strict.csv
+memocore audit-score --csv runs/audit_strict.csv
 ```
 
-在导出的 CSV 的 `human_label` 列填 `CORRECT` / `WRONG`（也可以填 对 / 错），然后：
-
-```bash
-memocore audit-score --csv runs/hybrid/audit_strict.csv
-```
+- **盲标**：标注表里没有裁判结论，也没有系统名，人工标签不会被裁判或"这是哪个系统"带偏；打分时才按题号把裁判结论对回来。
+- **跨系统抽样**：题目不重复，几个运行轮流分配，裁判要是偏袒某个系统也能看出来。
+- **只抽 LLM 裁判判定的题**：精确匹配和"没提到"这类由规则判定的题按构造就是对的，抽它们只会虚高一致率（`--include-rule` 可以加回来）。
+- **终端逐题标注**：显示问题、标准答案、回答和原文证据，按 1 / 0 / ? 标注，每题都即时保存，可以随时退出再续。也可以直接在 CSV 的 `human_label` 列填 对 / 错 / ?。
+- **输出**：一致率及 Wilson 置信区间、Cohen's kappa、裁判偏严/偏松各几题、同一批题上裁判与人工各自算出的准确率、按系统和题型的一致率，以及每道分歧题的裁判理由。
 
 ## 实际花费（300 题子集，三个系统）
 
@@ -187,7 +249,7 @@ memocore audit-score --csv runs/hybrid/audit_strict.csv
 2. **冲突感知读取**：同一属性多次变化时，按时间排序返回并标注哪条最新（用 LongMemEval knowledge-update 题验证）。
 3. **带质量门的派生索引**：LLM 抽取的实体卡片、事实，每条都必须能回链到原文轮次并通过忠实性校验。
 4. **重排降本**：只在向量检索不确定时才重排。
-5. **服务化**：REST 和 MCP 接口、多用户隔离、异步写入、k6 压测；接入 RepoPilot。
+5. **服务化**：MCP 服务和多用户隔离已完成；还差 REST 接口、增量向量索引（用户记忆很多时不必每次重建）、异步写入和压测；接入 RepoPilot。
 6. **更多基准**：LongMemEval 子集、LoCoMo-Refined 交叉评测；以 Mem0 作为外部对照；人工抽检裁判一致率。
 
 ## 目录
@@ -196,14 +258,17 @@ memocore audit-score --csv runs/hybrid/audit_strict.csv
 src/memocore/
   datasets/locomo.py   数据加载，题型编号与官方一致
   temporal.py          写入时时间锚定（规则，不调用 LLM）
+  store.py             持久化记忆库 MemoryStore：SQLite、多用户、按编号取原文、彻底删除
+  mcp_server.py        MCP 服务：remember / recall / read_memories / forget
   retrieval/           BM25（含中文二元分词）、RRF 与候选池、交叉编码器重排
   systems/             no_memory、full_context、naive_rag、hybrid_rag
   prompts.py           所有系统共用的回答 prompt（v1～v3，v3 要求引用出处）
   metrics.py           F1（复刻官方口径）、证据召回、答案可见率
   judge.py             严格 / 宽松裁判与输出解析
-  runner.py            回答、裁判、汇总、人工抽检
-  compare.py, stats.py 配对对比、bootstrap 置信区间
-  retrieval_eval.py    不调用 LLM 的检索扫描与消融
+  runner.py            回答、裁判、汇总
+  audit.py             裁判盲标抽检：跨系统抽样、终端标注、一致率与 kappa
+  compare.py, stats.py 配对对比、bootstrap 与 Wilson 置信区间、kappa
+  retrieval_eval.py    不调用 LLM 的检索扫描、消融，以及记忆库逐条回放核对
   llm.py, embeddings.py, kvcache.py  模型客户端与各类缓存
 docs/                  对比、评测方法、可借鉴项目、实测结果
 tests/                 离线单元测试（mock 模型 + 哈希向量，不需要 API Key）

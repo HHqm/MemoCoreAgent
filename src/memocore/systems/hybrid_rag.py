@@ -167,6 +167,9 @@ class HybridRAGSystem(MemorySystem):
     def turn_ids(self, indices: Sequence[int]) -> tuple[str, ...]:
         return tuple(self._pairs[i][1].dia_id for i in indices)
 
+    def turns(self, indices: Sequence[int]) -> list[tuple[Session, Turn]]:
+        return [self._pairs[i] for i in indices]
+
     def render(self, indices: Sequence[int]) -> RetrievedContext:
         return render_turns([self._pairs[i] for i in sorted(indices)], self.cite)
 

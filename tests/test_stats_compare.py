@@ -5,7 +5,7 @@ from memocore.embeddings import HashingEmbedder
 from memocore.llm import MockChat
 from memocore.retrieval.rerank import LexicalReranker
 from memocore.runner import RunConfig, run_judge, run_predictions, summarize
-from memocore.stats import bootstrap_ci, paired_bootstrap
+from memocore.stats import bootstrap_ci, cohen_kappa, paired_bootstrap, wilson_ci
 from tests.helpers import temp_settings
 
 
@@ -17,6 +17,17 @@ class StatsTest(unittest.TestCase):
         self.assertGreater(high, 0.6)
         self.assertEqual(bootstrap_ci(values), (low, high))
         self.assertIsNone(bootstrap_ci([1.0]))
+
+    def test_wilson_and_kappa(self):
+        low, high = wilson_ci(90, 100)
+        self.assertLess(low, 0.9)
+        self.assertLess(0.9, high)
+        self.assertLessEqual(wilson_ci(10, 10)[1], 1.0)
+        self.assertIsNone(wilson_ci(0, 0))
+        # 90% raw agreement, but on a skewed label mix most of it is chance.
+        pairs = [("C", "C")] * 85 + [("C", "W")] * 5 + [("W", "C")] * 5 + [("W", "W")] * 5
+        self.assertAlmostEqual(cohen_kappa(pairs), (0.9 - (0.9 * 0.9 + 0.1 * 0.1)) / (1 - 0.82))
+        self.assertIsNone(cohen_kappa([("C", "C")] * 3))
 
     def test_paired_bootstrap_detects_a_clear_gain(self):
         baseline = [0.0] * 50 + [1.0] * 50
