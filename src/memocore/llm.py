@@ -7,7 +7,8 @@ import json
 import sqlite3
 import threading
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, astuple, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
@@ -20,6 +21,11 @@ class Usage:
     completion_tokens: int = 0
     # Prompt tokens served from the provider's prefix cache (DeepSeek: prompt_cache_hit_tokens).
     cached_prompt_tokens: int = 0
+    # Part of completion_tokens a thinking model spent reasoning; billed as output.
+    reasoning_tokens: int = 0
+
+    def __add__(self, other: Usage) -> Usage:
+        return Usage(*(a + b for a, b in zip(astuple(self), astuple(other))))
 
 
 @dataclass(frozen=True)
@@ -30,6 +36,7 @@ class Completion:
     from_cache: bool = False
     # "length" means the token cap cut the reply off; thinking models spend part of it on reasoning.
     finish_reason: str | None = None
+    called_at: str | None = None  # UTC time of a live call, which decides peak or off-peak pricing
 
 
 class ChatModel(Protocol):
@@ -50,12 +57,13 @@ class ResponseCache:
         self._conn.commit()
 
     @staticmethod
-    def key(model: str, messages: list[Message], max_tokens: int, temperature: float) -> str:
-        raw = json.dumps(
-            {"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature},
-            ensure_ascii=False,
-            sort_keys=True,
-        )
+    def key(
+        model: str, messages: list[Message], max_tokens: int, temperature: float, reasoning: str | None = None
+    ) -> str:
+        request: dict[str, Any] = {"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature}
+        if reasoning is not None:  # absent for the API default, so responses cached before this option still match
+            request["reasoning"] = reasoning
+        raw = json.dumps(request, ensure_ascii=False, sort_keys=True)
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
     def get(self, key: str) -> Completion | None:
@@ -87,6 +95,9 @@ class ResponseCache:
             self._conn.commit()
 
 
+REASONING_LEVELS = ("none", "low", "high", "max")
+
+
 class OpenAICompatibleChat:
     def __init__(
         self,
@@ -97,24 +108,38 @@ class OpenAICompatibleChat:
         cache: ResponseCache | None = None,
         timeout: float = 120.0,
         max_retries: int = 6,
+        reasoning: str | None = None,
     ):
         if not api_key:
             raise ValueError("缺少 API Key：请在环境变量或 .env 中设置 DEEPSEEK_API_KEY（或 MEMOCORE_API_KEY），或者加 --mock 离线运行。")
+        if reasoning is not None and reasoning not in REASONING_LEVELS:
+            raise ValueError(f"unknown reasoning level {reasoning!r}; choose from {', '.join(REASONING_LEVELS)}")
         from openai import OpenAI
 
         self.model = model
+        # DeepSeek models think by default at effort "high"; "none" turns thinking off (api-docs.deepseek.com).
+        # While thinking, temperature is ignored, so answers are not deterministic even at temperature 0.
+        self.reasoning = reasoning
         self._client = OpenAI(api_key=api_key, base_url=base_url, timeout=timeout, max_retries=max_retries)
         self._cache = cache
 
+    def _reasoning_args(self) -> dict[str, Any]:
+        if self.reasoning is None:
+            return {}
+        if self.reasoning == "none":
+            return {"extra_body": {"thinking": {"type": "disabled"}}}
+        return {"reasoning_effort": self.reasoning}
+
     def complete(self, messages: list[Message], *, max_tokens: int, temperature: float = 0.0) -> Completion:
-        key = ResponseCache.key(self.model, messages, max_tokens, temperature) if self._cache else None
+        key = ResponseCache.key(self.model, messages, max_tokens, temperature, self.reasoning) if self._cache else None
         if self._cache and key:
             hit = self._cache.get(key)
             if hit is not None:
                 return hit
+        called_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
         start = time.perf_counter()
         response = self._client.chat.completions.create(
-            model=self.model, messages=messages, max_tokens=max_tokens, temperature=temperature
+            model=self.model, messages=messages, max_tokens=max_tokens, temperature=temperature, **self._reasoning_args()
         )
         choice = response.choices[0]
         completion = Completion(
@@ -122,6 +147,7 @@ class OpenAICompatibleChat:
             usage=_usage(response.usage),
             latency_s=time.perf_counter() - start,
             finish_reason=choice.finish_reason,
+            called_at=called_at,
         )
         # A truncated reply is not cached, so a rerun with a larger cap can retry it.
         if self._cache and key and choice.finish_reason != "length":
@@ -136,10 +162,12 @@ def _usage(raw: Any) -> Usage:
     if cached is None:
         details = getattr(raw, "prompt_tokens_details", None)
         cached = getattr(details, "cached_tokens", None) if details is not None else None
+    details = getattr(raw, "completion_tokens_details", None)
     return Usage(
         prompt_tokens=raw.prompt_tokens or 0,
         completion_tokens=raw.completion_tokens or 0,
         cached_prompt_tokens=cached or 0,
+        reasoning_tokens=(getattr(details, "reasoning_tokens", None) or 0) if details is not None else 0,
     )
 
 

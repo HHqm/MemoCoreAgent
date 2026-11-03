@@ -84,7 +84,7 @@
 | 指标 | 与官方口径一致的 token F1；严格、宽松两套 LLM 裁判；证据召回；答案可见率；token、前缀缓存命中、延迟 |
 | 统计 | bootstrap 95% 置信区间；`compare` 按题配对比较两个运行，给出差值区间和 p 值；裁判盲审抽检（一致率、Wilson 区间、kappa、偏严 / 偏松） |
 | 接入 | `MemoryStore`（SQLite 持久化、多用户隔离、按编号取原文、彻底删除）和 MCP 服务（remember / recall / read_memories / forget），读取路径与评测完全一致 |
-| 工程 | 断点续跑；LLM 响应、向量、重排分数全部按内容寻址缓存；设置不一致拒绝续跑；`--qa-ids` 定向抽查；`--mock` 离线全流程；GPU 半精度与批量编码；GitHub Actions 跑 78 个离线测试，已发布结果用到的 prompt 哈希被测试锁定 |
+| 工程 | 断点续跑；逐次计费（缓存命中、思考 token、高峰 / 低谷单价）与开跑前预估；LLM 响应、向量、重排分数全部按内容寻址缓存；设置不一致拒绝续跑；`--qa-ids` 定向抽查；`--mock` 离线全流程；GPU 半精度与批量编码；GitHub Actions 跑 85 个离线测试，已发布结果用到的 prompt 哈希被测试锁定 |
 
 ## 接入 Agent：MCP 服务与 Python 库
 
@@ -237,6 +237,22 @@ memocore audit-score --csv runs/audit_strict.csv
 - **偏严集中在"不越界"**：多带一个与题目相符的细节（"A new Prius"、"Evening of 11 July"）也会被判错。
 - **系统比较没有被放大**：偏严程度在 hybrid（+29）和 full_context（+19）上比 naive（+8）更明显，所以 hybrid 对 naive 的领先更可能被低估（每个系统约 25 题，只看方向）。
 
+## API 使用与成本
+
+每次调用都记录命中缓存、未命中、思考 token 和调用时段，按 DeepSeek 官方单价算出花费（元）；`run` 和 `judge` 开跑前打印预计花费和几点起半价；`memocore cost` 统计各次运行实际花了多少。到目前为止全部运行合计 **¥15～29**，一次 300 题的系统评测（作答 + 裁判）约 ¥1.3～3.3。
+
+审计和小样本探测（约 ¥1）的发现，详见 [docs/results/api_usage.md](docs/results/api_usage.md)：
+
+| 发现 | 数据 |
+|---|---|
+| 输出几乎全是思考 | 回答本身约 15 token，每次却输出 120～300 token；裁判每次约 370 |
+| 检索类提示词几乎不命中前缀缓存 | 记忆放在最前面、每题不同，v3 只有 2.5% 命中；固定文本前置的 v4 命中 16.5%，但输出是大头，总花费只少约 4% |
+| 关闭思考最省 | 作答输出 -95%、花费 -41%、延迟 -58%；裁判花费 -72%，与盲审一致率从 80% 变为 89%（更宽松） |
+| 思考模式下 temperature 不生效 | 同一 prompt 重答，43% 的答案会变（关闭思考后 23%），本地响应缓存是结果可复现的前提 |
+| 低谷时段半价 | 工作日北京时间 9:00～12:00、14:00～18:00 以外和周末全天 |
+
+关闭思考会改变答案和判分，所以还没有替换默认值；可以用 `--reasoning none` 试。
+
 ## 实际花费（300 题子集，三个系统）
 
 | 环节 | prompt token（其中命中缓存） | 输出 token |
@@ -287,7 +303,8 @@ src/memocore/
   audit.py             裁判盲标抽检：跨系统抽样、终端标注、一致率与 kappa
   compare.py, stats.py 配对对比、bootstrap 与 Wilson 置信区间、kappa
   retrieval_eval.py    不调用 LLM 的检索扫描、消融，以及记忆库逐条回放核对
-  llm.py, embeddings.py, kvcache.py  模型客户端与各类缓存
+  llm.py, embeddings.py, kvcache.py  模型客户端（含思考程度）与各类缓存
+  pricing.py, spend.py  官方单价、高峰 / 低谷判断、逐次计费与花费统计
 docs/                  对比、评测方法、可借鉴项目、实测结果
 tests/                 离线单元测试（mock 模型 + 哈希向量，不需要 API Key）
 ```

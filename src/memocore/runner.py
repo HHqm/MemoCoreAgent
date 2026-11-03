@@ -11,6 +11,7 @@ import random
 import sys
 import time
 from collections import Counter
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,8 +33,9 @@ from memocore.judge import (
     parse_verdict,
     rule_verdict,
 )
-from memocore.llm import ChatModel, Message, MockChat, OpenAICompatibleChat, ResponseCache
+from memocore.llm import ChatModel, Completion, Message, MockChat, OpenAICompatibleChat, ResponseCache, Usage
 from memocore.metrics import answer_visible, citation_scores, evidence_recall, locomo_f1
+from memocore.pricing import call_cost, estimate_line
 from memocore.prompts import (
     ANSWER_MAX_TOKENS,
     CITING_PROMPTS,
@@ -86,6 +88,8 @@ class RunConfig:
     time_candidates: int = 20
     speaker_boost: float = 0.1
     prompt: str = DEFAULT_PROMPT
+    # Answer model's thinking: None keeps the API default (thinking, effort "high"); "none" turns it off.
+    reasoning: str | None = None
     mock: bool = False
 
     @property
@@ -119,12 +123,16 @@ def build_reranker(settings: Settings) -> Reranker:
 
 
 def build_chat(
-    settings: Settings, model: str, *, mock: bool, responder=None
+    settings: Settings, model: str, *, mock: bool, responder=None, reasoning: str | None = None
 ) -> ChatModel:
     if mock:
         return MockChat(responder=responder)
     return OpenAICompatibleChat(
-        model, api_key=settings.api_key, base_url=settings.base_url, cache=ResponseCache(settings.cache_path)
+        model,
+        api_key=settings.api_key,
+        base_url=settings.base_url,
+        cache=ResponseCache(settings.cache_path),
+        reasoning=reasoning,
     )
 
 
@@ -162,7 +170,7 @@ def run_predictions(
     workers: int = 8,
     progress: bool = True,
 ) -> Path:
-    chat = chat or build_chat(settings, settings.answer_model, mock=cfg.mock)
+    chat = chat or build_chat(settings, settings.answer_model, mock=cfg.mock, reasoning=cfg.reasoning)
     run_dir = settings.runs_dir / cfg.run_name
     run_dir.mkdir(parents=True, exist_ok=True)
     if cfg.system not in NEEDS_EMBEDDER:
@@ -181,6 +189,10 @@ def run_predictions(
     total = sum(qa.qa_id not in done for _, questions in selected for qa in questions)
     if progress:
         print(f"回答[{cfg.system}]：已完成 {len(done)} 题，本次调用回答模型 {total} 次", file=sys.stderr)
+        if not cfg.mock:
+            kind = "answer_full_context" if cfg.system == "full_context" else "answer"
+            if line := estimate_line(chat.model, total, kind):
+                print(line, file=sys.stderr)
 
     with (
         JsonlWriter(pred_path) as predictions,
@@ -241,6 +253,7 @@ def _identity(
         "system": cfg.system,
         "answer_model": chat.model,
         "prompt_version": prompt_version(cfg.prompt),
+        "reasoning": cfg.reasoning,
         "mock": cfg.mock,
         "top_k": cfg.top_k if retrieval else None,
         "chunk_turns": cfg.chunk_turns if cfg.system == "naive_rag" else None,
@@ -269,6 +282,29 @@ def _check_identity(run_dir: Path, identity: dict[str, Any]) -> None:
         raise RunMismatchError(f"运行 {run_dir.name!r} 是用不同设置创建的：{diff}。请换一个 --run-name。")
 
 
+def _complete(chat: ChatModel, messages: list[Message], max_tokens: int) -> tuple[Completion, dict[str, Any]]:
+    """One call, retried once with twice the cap if a thinking model spent it all; usage covers both calls."""
+    attempts = [chat.complete(messages, max_tokens=max_tokens, temperature=0.0)]
+    if attempts[0].finish_reason == "length":
+        attempts.append(chat.complete(messages, max_tokens=max_tokens * 2, temperature=0.0))
+    usage = sum((attempt.usage for attempt in attempts), Usage())
+    live = [attempt for attempt in attempts if not attempt.from_cache]
+    costs = [
+        call_cost(chat.model, a.usage.prompt_tokens, a.usage.cached_prompt_tokens, a.usage.completion_tokens,
+                  datetime.fromisoformat(a.called_at) if a.called_at else None)
+        for a in live
+    ]
+    return attempts[-1], {
+        "prompt_tokens": usage.prompt_tokens,
+        "cached_prompt_tokens": usage.cached_prompt_tokens,
+        "completion_tokens": usage.completion_tokens,
+        "reasoning_tokens": usage.reasoning_tokens,
+        # What this run paid; a response served from the local cache costs nothing.
+        "cost_cny": None if any(cost is None for cost in costs) else round(sum(costs), 6),
+        "called_at": live[-1].called_at if live else None,
+    }
+
+
 def _answer_one(
     chat: ChatModel,
     conversation: Conversation,
@@ -278,10 +314,7 @@ def _answer_one(
     retrieve_s: float,
 ) -> dict[str, Any]:
     messages = answer_messages(conversation, context.text, qa.question, prompt)
-    completion = chat.complete(messages, max_tokens=ANSWER_MAX_TOKENS, temperature=0.0)
-    if completion.finish_reason == "length":
-        # The thinking model occasionally spends the whole cap on reasoning and returns nothing; one larger retry.
-        completion = chat.complete(messages, max_tokens=ANSWER_MAX_TOKENS * 2, temperature=0.0)
+    completion, spend = _complete(chat, messages, ANSWER_MAX_TOKENS)
     answer, cited = completion.text, None
     if prompt in CITING_PROMPTS:
         answer, cited = split_citations(completion.text)
@@ -299,9 +332,7 @@ def _answer_one(
         "answer_visible": answer_visible(qa.gold, context.text, qa.category),
         "context_turns": len(context.turn_ids),
         "retrieved_ids": list(context.turn_ids) if len(context.turn_ids) <= MAX_STORED_IDS else None,
-        "prompt_tokens": completion.usage.prompt_tokens,
-        "cached_prompt_tokens": completion.usage.cached_prompt_tokens,
-        "completion_tokens": completion.usage.completion_tokens,
+        **spend,
         "answer_latency_s": round(completion.latency_s, 4),
         "retrieve_latency_s": round(retrieve_s, 4),
         "from_cache": completion.from_cache,
@@ -334,6 +365,9 @@ def run_judge(
         by_rule = sum(rule_verdict(row["gold"], row["prediction"]) is not None for row in todo)
         print(f"裁判[{kind}]：待判 {len(todo)} 题，规则直接判定 {by_rule} 题，调用裁判模型 {len(todo) - by_rule} 次",
               file=sys.stderr)
+        if not info.get("mock"):
+            if line := estimate_line(settings.judge_model, len(todo) - by_rule, "judge"):
+                print(line, file=sys.stderr)
     # A mock run is graded by the mock judge, so its placeholder answers never reach a paid API.
     chat = chat or build_chat(settings, settings.judge_model, mock=info.get("mock", False), responder=mock_judge_responder)
     with (
@@ -360,10 +394,7 @@ def _judge_one(chat: ChatModel, kind: str, prediction: dict[str, Any]) -> dict[s
             "finish_reason": None,
         }
     messages: list[Message] = judge_messages(kind, prediction["question"], prediction["gold"], prediction["prediction"])
-    completion = chat.complete(messages, max_tokens=JUDGE_MAX_TOKENS, temperature=0.0)
-    if completion.finish_reason == "length":
-        # About 2% of the time the thinking judge spends the whole cap on reasoning; one larger retry.
-        completion = chat.complete(messages, max_tokens=JUDGE_MAX_TOKENS * 2, temperature=0.0)
+    completion, spend = _complete(chat, messages, JUDGE_MAX_TOKENS)
     verdict = parse_verdict(completion.text)
     return {
         "qa_id": prediction["qa_id"],
@@ -372,9 +403,8 @@ def _judge_one(chat: ChatModel, kind: str, prediction: dict[str, Any]) -> dict[s
         "reasoning": verdict.reasoning,
         "judge_model": chat.model,
         "finish_reason": completion.finish_reason,
-        "prompt_tokens": completion.usage.prompt_tokens,
-        "cached_prompt_tokens": completion.usage.cached_prompt_tokens,
-        "completion_tokens": completion.usage.completion_tokens,
+        "from_cache": completion.from_cache,
+        **spend,
     }
 
 
@@ -444,12 +474,12 @@ def _group_stats(rows: list[dict[str, Any]], verdicts: dict[str, dict[str, dict[
     return stats
 
 
-def _token_totals(rows: Iterable[dict[str, Any]]) -> dict[str, int]:
-    totals = Counter()
+def _token_totals(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    totals: Counter = Counter()
     for row in rows:
-        for key in ("prompt_tokens", "cached_prompt_tokens", "completion_tokens"):
+        for key in ("prompt_tokens", "cached_prompt_tokens", "completion_tokens", "reasoning_tokens", "cost_cny"):
             totals[key] += row.get(key) or 0
-    return dict(totals)
+    return {key: round(value, 4) if key == "cost_cny" else value for key, value in totals.items()}
 
 
 def _pct(value: float | None) -> str:
@@ -516,11 +546,12 @@ def render_markdown(summary: dict[str, Any]) -> str:
             f"引用精确率 {_pct(overall.get('citation_precision'))}，标注证据被引用 {_pct(overall.get('citation_recall'))}，"
             f"引用落在上下文内 {_pct(overall.get('citation_in_context'))}",
         ]
-    lines += ["", "Token 合计（prompt / 其中命中前缀缓存 / completion）：", ""]
+    lines += ["", "Token 合计（prompt / 其中命中前缀缓存 / completion / 其中思考）与本次实际花费：", ""]
     for stage, totals in summary["tokens"].items():
         lines.append(
             f"- {stage}：{_num(totals.get('prompt_tokens', 0))} / {_num(totals.get('cached_prompt_tokens', 0))} / "
-            f"{_num(totals.get('completion_tokens', 0))}"
+            f"{_num(totals.get('completion_tokens', 0))} / {_num(totals.get('reasoning_tokens', 0))}，"
+            f"¥{totals.get('cost_cny', 0):.2f}"
         )
     unparsed = {kind: summary["groups"]["overall"].get(f"judge_{kind}_unparsed", 0) for kind in JUDGE_KINDS}
     if any(unparsed.values()):

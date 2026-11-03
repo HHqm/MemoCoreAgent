@@ -9,6 +9,7 @@ from memocore.audit import export_audit, label_audit, score_audit
 from memocore.config import Settings
 from memocore.datasets.locomo import CATEGORY_NAMES, DEFAULT_CATEGORIES, LOCOMO_URL, load_locomo
 from memocore.judge import JUDGE_KINDS
+from memocore.llm import REASONING_LEVELS
 from memocore.prompts import ANSWER_TEMPLATES, DEFAULT_PROMPT
 from memocore.runner import (
     SUMMARY_MD,
@@ -75,6 +76,9 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--judge", choices=(*JUDGE_KINDS, "both", "none"), default="strict", help="默认只跑严格裁判以节省额度"
     )
+    run.add_argument(
+        "--reasoning", choices=REASONING_LEVELS, help="回答模型的思考程度；默认沿用 API 的默认值（思考，high），none 为关闭思考"
+    )
     run.add_argument("--workers", type=int, default=8)
     run.add_argument("--mock", action="store_true", help="离线占位模型，只检查流程，不调用 API")
 
@@ -118,6 +122,8 @@ def build_parser() -> argparse.ArgumentParser:
         "memory-replay", help="把 LoCoMo 逐条写入 MemoryStore 再检索，核对与评测过的检索路径逐题一致，不调用 LLM"
     )
     replay.add_argument("--budget", type=int, default=20)
+
+    sub.add_parser("cost", help="统计各次运行实际花了多少钱（只读本地记录，不调用 API）")
 
     serve = sub.add_parser("mcp", help="启动 MCP 服务（stdio），让 Claude Code 等 Agent 读写长期记忆")
     serve.add_argument("--user", default="default", help="记忆归属的用户；不同用户的记忆互相隔离")
@@ -182,6 +188,7 @@ def _dispatch(args: argparse.Namespace, settings: Settings) -> int:
             context_before=args.context_before,
             time_candidates=args.time_candidates,
             speaker_boost=args.speaker_boost,
+            reasoning=args.reasoning,
             mock=args.mock,
         )
         run_predictions(cfg, settings, workers=args.workers)
@@ -225,6 +232,10 @@ def _dispatch(args: argparse.Namespace, settings: Settings) -> int:
         print(json.dumps(memory_replay(settings, budget=args.budget), ensure_ascii=False, indent=2))
     elif args.command == "mcp":
         _serve(settings, args)
+    elif args.command == "cost":
+        from memocore.spend import render_spend, spend_report
+
+        print(render_spend(spend_report(settings)))
     return 0
 
 
