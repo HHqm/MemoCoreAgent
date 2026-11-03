@@ -96,6 +96,9 @@ class ResponseCache:
 
 
 REASONING_LEVELS = ("none", "low", "high", "max")
+# A response with no choices is asked for again this many times, after 2 s, then 4 s, ...
+EMPTY_RETRIES = 2
+EMPTY_BACKOFF_S = 2.0
 
 
 class OpenAICompatibleChat:
@@ -138,9 +141,18 @@ class OpenAICompatibleChat:
                 return hit
         called_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
         start = time.perf_counter()
-        response = self._client.chat.completions.create(
-            model=self.model, messages=messages, max_tokens=max_tokens, temperature=temperature, **self._reasoning_args()
-        )
+        for attempt in range(EMPTY_RETRIES + 1):
+            response = self._client.chat.completions.create(
+                model=self.model, messages=messages, max_tokens=max_tokens, temperature=temperature, **self._reasoning_args()
+            )
+            # DeepSeek once answered with a success status but no choices, which the client does not
+            # retry (2026-11-03, 10 calls into a 188-call judge run): ask again instead of ending the run.
+            if response.choices:
+                break
+            if attempt < EMPTY_RETRIES:
+                time.sleep(EMPTY_BACKOFF_S * (attempt + 1))
+        else:
+            raise RuntimeError(f"{self.model} returned no choices {EMPTY_RETRIES + 1} times in a row")
         choice = response.choices[0]
         completion = Completion(
             text=(choice.message.content or "").strip(),

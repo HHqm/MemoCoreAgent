@@ -12,7 +12,7 @@ import sys
 import time
 from collections import Counter
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from statistics import fmean
@@ -245,10 +245,25 @@ def run_predictions(
                     pool.submit(_answer_one, chat, conversation, cfg.prompt, qa, context, retrieve_s)
                     for qa, context, retrieve_s in jobs[1:]
                 ]
-                for future in as_completed(futures):
-                    predictions.write(future.result())
-                    bar.update(1)
+                _write_all(futures, predictions, bar)
     return pred_path
+
+
+def _write_all(futures: list[Future], writer: JsonlWriter, bar: tqdm) -> None:
+    """Write every result as it completes, also after another call has failed, and raise the first error
+    once all are done. Calls already in flight finish and are paid for even when one fails; a result left
+    unwritten would sit only in the response cache and count as free when a rerun replays it."""
+    error: BaseException | None = None
+    for future in as_completed(futures):
+        try:
+            result = future.result()
+        except Exception as exc:  # noqa: BLE001 - re-raised below, after the others are recorded
+            error = error or exc
+            continue
+        writer.write(result)
+        bar.update(1)
+    if error is not None:
+        raise error
 
 
 def _identity(
@@ -387,9 +402,7 @@ def run_judge(
         tqdm(total=len(todo), desc=f"judge[{kind}]", disable=not progress) as bar,
     ):
         futures = [pool.submit(_judge_one, chat, kind, row) for row in todo]
-        for future in as_completed(futures):
-            writer.write(future.result())
-            bar.update(1)
+        _write_all(futures, writer, bar)
     return out
 
 

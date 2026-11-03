@@ -54,6 +54,25 @@ class ApiUsageTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             args("medium")
 
+    def test_a_response_without_choices_is_asked_for_again(self):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        reply = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=" Paris "), finish_reason="stop")],
+            usage=SimpleNamespace(prompt_tokens=10, completion_tokens=2, prompt_cache_hit_tokens=0),
+        )
+        empty = SimpleNamespace(choices=None, usage=None)
+        chat = OpenAICompatibleChat("deepseek-flash", api_key="unused", base_url="http://unused.invalid")
+        create = mock.Mock(side_effect=[empty, reply])
+        chat._client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+        with mock.patch("memocore.llm.time.sleep"):
+            self.assertEqual(chat.complete([], max_tokens=5).text, "Paris")
+            self.assertEqual(create.call_count, 2)
+            create.side_effect = [empty] * 3
+            with self.assertRaises(RuntimeError):
+                chat.complete([], max_tokens=5)
+
     def test_a_truncated_call_and_its_retry_are_both_counted(self):
         class Scripted:
             model = "deepseek-flash"

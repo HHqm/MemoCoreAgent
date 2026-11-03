@@ -99,6 +99,25 @@ class RunnerTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             compare_runs(self.settings, "t", "t", "judge_bogus-none")
 
+    def test_a_failed_call_does_not_lose_the_calls_that_finished(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from types import SimpleNamespace
+
+        from memocore.runner import _write_all
+
+        written = []
+
+        def call(i):
+            if i == 0:
+                raise RuntimeError("no choices")
+            return i
+
+        writer, bar = SimpleNamespace(write=written.append), SimpleNamespace(update=lambda n: None)
+        with ThreadPoolExecutor(max_workers=4) as pool, self.assertRaises(RuntimeError):
+            _write_all([pool.submit(call, i) for i in range(6)], writer, bar)
+        # Everything but the failed call is recorded, so a rerun repeats only that one.
+        self.assertEqual(sorted(written), [1, 2, 3, 4, 5])
+
     def test_judge_summary(self):
         self._run()
         run_judge("t", "strict", self.settings, progress=False)
