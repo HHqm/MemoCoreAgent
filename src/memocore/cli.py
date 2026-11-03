@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+import time
 from pathlib import Path
 
 from memocore.audit import export_audit, label_audit, score_audit
@@ -79,12 +81,17 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--reasoning", choices=REASONING_LEVELS, help="回答模型的思考程度；默认沿用 API 的默认值（思考，high），none 为关闭思考"
     )
+    run.add_argument("--wait-off-peak", action="store_true", help="等到低谷时段（半价）再开始调用 API")
     run.add_argument("--workers", type=int, default=8)
     run.add_argument("--mock", action="store_true", help="离线占位模型，只检查流程，不调用 API")
 
     judge = sub.add_parser("judge", help="对已有运行补做裁判")
     judge.add_argument("--run-name", required=True)
     judge.add_argument("--kind", choices=(*JUDGE_KINDS, "both"), default="strict")
+    judge.add_argument(
+        "--reasoning", choices=REASONING_LEVELS, help="裁判的思考程度；设了以后结果写到 judge_<kind>-<程度>.jsonl，不与默认裁判混在一起"
+    )
+    judge.add_argument("--wait-off-peak", action="store_true", help="等到低谷时段（半价）再开始调用 API")
     judge.add_argument("--workers", type=int, default=8)
 
     report = sub.add_parser("report", help="重新生成汇总表")
@@ -129,6 +136,12 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--user", default="default", help="记忆归属的用户；不同用户的记忆互相隔离")
     serve.add_argument("--db", type=Path, help="记忆库文件，默认 data/memory.sqlite")
     serve.add_argument("--offline", action="store_true", help="用哈希向量和字面重排代替模型，只用来试流程")
+
+    http = sub.add_parser("serve", help="启动 REST 接口（FastAPI），并发检索会合批使用 GPU；接口文档在 /docs")
+    http.add_argument("--host", default="127.0.0.1")
+    http.add_argument("--port", type=int, default=8000)
+    http.add_argument("--db", type=Path, help="记忆库文件，默认 data/memory.sqlite")
+    http.add_argument("--offline", action="store_true", help="用哈希向量和字面重排代替模型，只用来试流程")
     return parser
 
 
@@ -191,13 +204,17 @@ def _dispatch(args: argparse.Namespace, settings: Settings) -> int:
             reasoning=args.reasoning,
             mock=args.mock,
         )
+        if args.wait_off_peak and not args.mock:
+            _wait_off_peak()
         run_predictions(cfg, settings, workers=args.workers)
         for kind in _judge_kinds(args.judge):
             run_judge(cfg.run_name, kind, settings, workers=args.workers)
         _report(settings, cfg.run_name)
     elif args.command == "judge":
+        if args.wait_off_peak:
+            _wait_off_peak()
         for kind in _judge_kinds(args.kind):
-            run_judge(args.run_name, kind, settings, workers=args.workers)
+            run_judge(args.run_name, kind, settings, workers=args.workers, reasoning=args.reasoning)
         _report(settings, args.run_name)
     elif args.command == "report":
         _report(settings, args.run_name)
@@ -232,6 +249,8 @@ def _dispatch(args: argparse.Namespace, settings: Settings) -> int:
         print(json.dumps(memory_replay(settings, budget=args.budget), ensure_ascii=False, indent=2))
     elif args.command == "mcp":
         _serve(settings, args)
+    elif args.command == "serve":
+        _serve_http(settings, args)
     elif args.command == "cost":
         from memocore.spend import render_spend, spend_report
 
@@ -239,8 +258,19 @@ def _dispatch(args: argparse.Namespace, settings: Settings) -> int:
     return 0
 
 
-def _serve(settings: Settings, args: argparse.Namespace) -> None:
-    from memocore.mcp_server import build_server
+def _wait_off_peak() -> None:
+    from datetime import datetime, timezone
+
+    from memocore.pricing import BEIJING, next_off_peak
+
+    now = datetime.now(timezone.utc)
+    start = next_off_peak(now)
+    if start > now:
+        print(f"等到低谷时段再调用 API：北京时间 {start.astimezone(BEIJING):%m-%d %H:%M} 开始", file=sys.stderr, flush=True)
+        time.sleep((start - now).total_seconds() + 5)
+
+
+def _open_store(settings: Settings, args: argparse.Namespace, *, batching: bool = False):
     from memocore.store import MemoryStore
 
     if args.offline:
@@ -250,13 +280,31 @@ def _serve(settings: Settings, args: argparse.Namespace) -> None:
         embedder, reranker = HashingEmbedder(), LexicalReranker()
     else:
         from memocore.embeddings import SentenceTransformerEmbedder
-        from memocore.retrieval.rerank import CrossEncoderReranker
+        from memocore.retrieval.rerank import BatchingReranker, CrossEncoderReranker
 
         # No disk caches here: the store keeps its own vectors, so forgetting a message leaves nothing behind.
         embedder = SentenceTransformerEmbedder(settings.embedding_model, device=settings.embedding_device)
         reranker = CrossEncoderReranker(settings.reranker_model, device=settings.embedding_device)
-    store = MemoryStore(args.db or settings.data_dir / "memory.sqlite", embedder, reranker)
-    build_server(store, args.user).run("stdio")
+        if batching:  # concurrent searches share GPU calls
+            reranker = BatchingReranker(reranker)
+    return MemoryStore(args.db or settings.data_dir / "memory.sqlite", embedder, reranker)
+
+
+def _serve(settings: Settings, args: argparse.Namespace) -> None:
+    from memocore.mcp_server import build_server
+
+    build_server(_open_store(settings, args), args.user).run("stdio")
+
+
+def _serve_http(settings: Settings, args: argparse.Namespace) -> None:
+    import uvicorn
+
+    from memocore.http_server import build_app
+
+    token = os.environ.get("MEMOCORE_SERVER_TOKEN")
+    if args.host not in ("127.0.0.1", "localhost") and not token:
+        raise ValueError("监听非本机地址时必须设置 MEMOCORE_SERVER_TOKEN，否则任何人都能读写记忆")
+    uvicorn.run(build_app(_open_store(settings, args, batching=True), token=token), host=args.host, port=args.port)
 
 
 if __name__ == "__main__":

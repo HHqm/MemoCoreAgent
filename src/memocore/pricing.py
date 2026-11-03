@@ -55,6 +55,10 @@ TYPICAL_CALL = {
     "answer": (1_700, 0.0, 300),
     "answer_full_context": (21_300, 0.96, 140),
     "judge": (360, 0.0, 360),
+    # With thinking off (docs/results/api_usage.md).
+    "answer_no_thinking": (1_700, 0.0, 20),
+    "answer_full_context_no_thinking": (21_300, 0.96, 20),
+    "judge_no_thinking": (280, 0.0, 42),
 }
 BEIJING = timezone(timedelta(hours=8))
 

@@ -38,6 +38,47 @@ class LexicalPiecesTest(unittest.TestCase):
         self.assertEqual(list(scores), [2.0, 1.0, 0.0])
 
 
+class BatchingRerankerTest(unittest.TestCase):
+    class Slow:
+        """score_many stand-in: each call takes a while, so concurrent requests pile up behind it."""
+
+        name = "slow"
+
+        def __init__(self, fail=False):
+            self.calls, self.fail = [], fail
+
+        def score_many(self, requests):
+            import time
+
+            time.sleep(0.05)
+            if self.fail:
+                raise RuntimeError("GPU fell over")
+            self.calls.append(len(requests))
+            return [np.array([len(query) + len(p) for p in passages], dtype=np.float32) for query, passages in requests]
+
+    def test_concurrent_requests_share_model_calls_and_get_their_own_scores(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        from memocore.retrieval.rerank import BatchingReranker
+
+        inner = self.Slow()
+        reranker = BatchingReranker(inner, window_ms=20)
+        requests = [(f"q{i}", ["a" * i, "bb"]) for i in range(8)]
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(lambda r: reranker.score(*r), requests))
+        for (query, passages), scores in zip(requests, results):
+            self.assertEqual(list(scores), [len(query) + len(p) for p in passages])
+        self.assertEqual(sum(inner.calls), 8)
+        self.assertLess(len(inner.calls), 8)  # merged
+        self.assertEqual(len(reranker.score("q", [])), 0)
+
+    def test_errors_reach_every_waiting_request(self):
+        from memocore.retrieval.rerank import BatchingReranker
+
+        with self.assertRaises(RuntimeError):
+            BatchingReranker(self.Slow(fail=True)).score("q", ["p"])
+
+
 class HybridSystemTest(unittest.TestCase):
     def setUp(self):
         self.conversation = load_locomo(FIXTURE)[0].conversation

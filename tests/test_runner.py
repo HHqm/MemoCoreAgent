@@ -86,6 +86,19 @@ class RunnerTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             select_questions(samples, RunConfig(system="full_context", run_name="x", qa_ids=("conv-test#q9999",)))
 
+    def test_judge_at_another_thinking_level_writes_its_own_verdicts(self):
+        from memocore.compare import compare_runs
+
+        self._run()
+        run_judge("t", "strict", self.settings, progress=False)
+        variant = run_judge("t", "strict", self.settings, progress=False, reasoning="none")
+        self.assertEqual(variant.name, "judge_strict-none.jsonl")
+        self.assertEqual(len(list(read_jsonl(variant))), 7)
+        self.assertEqual(len(list(read_jsonl(judge_path(self.settings.runs_dir / "t", "strict")))), 7)
+        self.assertEqual(compare_runs(self.settings, "t", "t", "judge_strict-none")["groups"]["overall"]["n"], 7)
+        with self.assertRaises(ValueError):
+            compare_runs(self.settings, "t", "t", "judge_bogus-none")
+
     def test_judge_summary(self):
         self._run()
         run_judge("t", "strict", self.settings, progress=False)

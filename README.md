@@ -12,8 +12,40 @@
 - **写入不调用 LLM**：向量编码 + BM25 索引 + 规则时间锚定。
 - **读取靠精排**：bge-m3 召回，BM25 补充候选，伪相关反馈做第二跳，问题点名时间或人时补候选、加分，bge-reranker 重排。
 - **答案带出处**：回答必须引用原文轮次编号，无法引用的内容不许写；引用可以直接回原文核对。
-- **能直接接入 Agent**：持久化记忆库加 MCP 服务，Claude Code 一条命令就能用；用的是评测过的同一条读取路径，逐条回放 LoCoMo 后 1,540 题检索结果全部一致。
+- **能直接接入 Agent**：持久化记忆库加 MCP 服务和 REST 接口，Claude Code 一条命令就能用；用的是评测过的同一条读取路径，逐条回放 LoCoMo 后 1,540 题检索结果全部一致。
 - **每个改动都要在同一预算下用数字证明**。
+
+### 亮点一览
+
+| 方面 | 实测结果 |
+|---|---|
+| 检索 | 同样 20 轮上下文，证据召回 76.4% → **88.4%**，多跳题 57.3% → **74.7%**；0 次 LLM 调用 |
+| 端到端 | 比朴素检索准确率 **+5.3 个点**（配对检验 p = 0.017）；只用全量上下文 **6.5%** 的 token，达到其 91% 的准确率 |
+| 可追溯 | **96.3%** 的回答带原文出处，准确率不降（p = 1.0） |
+| 评测可信 | 配对 bootstrap 检验；裁判盲审一致率 80%，裁判 **0 题偏松**；五轮优化里否决了两项看似合理的做法 |
+| 接入 | MCP + REST + Python 库；写入一条 24 ms，检索 295 ms；动态合批让并发吞吐 **+40%** |
+| 成本 | 每次调用按官方单价记账，全部实验合计 ¥15～29；关闭思考可让作答省 41%、裁判省 72% |
+
+```mermaid
+flowchart LR
+    msg[新消息] --> anchor[时间锚定<br/>昨天 → 7 May 2023]
+    anchor --> db[(SQLite 一行一条<br/>原文 + 时间注释 + 向量)]
+    q[问题] --> dense[bge-m3 向量召回<br/>+ 说话人先验]
+    q --> bm25[BM25 补候选]
+    q --> when[问题点名的时段<br/>补候选]
+    db --> dense
+    db --> bm25
+    db --> when
+    dense --> rerank[bge-reranker 精排<br/>并发请求动态合批]
+    bm25 --> rerank
+    when --> rerank
+    rerank --> prf[伪相关反馈<br/>第二跳补候选]
+    prf --> rerank
+    rerank --> ctx[按预算选轮次<br/>带编号和日期]
+    ctx --> llm[LLM 作答<br/>必须引用编号]
+    llm --> check[按编号取回原文核对]
+    api[MCP / REST / Python 库] --- db
+```
 
 详见 [与高星项目的对比](docs/COMPARISON.md) 和 [评测方法](docs/EVALUATION.md)。
 
@@ -84,9 +116,9 @@
 | 指标 | 与官方口径一致的 token F1；严格、宽松两套 LLM 裁判；证据召回；答案可见率；token、前缀缓存命中、延迟 |
 | 统计 | bootstrap 95% 置信区间；`compare` 按题配对比较两个运行，给出差值区间和 p 值；裁判盲审抽检（一致率、Wilson 区间、kappa、偏严 / 偏松） |
 | 接入 | `MemoryStore`（SQLite 持久化、多用户隔离、按编号取原文、彻底删除）和 MCP 服务（remember / recall / read_memories / forget），读取路径与评测完全一致 |
-| 工程 | 断点续跑；逐次计费（缓存命中、思考 token、高峰 / 低谷单价）与开跑前预估；LLM 响应、向量、重排分数全部按内容寻址缓存；设置不一致拒绝续跑；`--qa-ids` 定向抽查；`--mock` 离线全流程；GPU 半精度与批量编码；GitHub Actions 跑 85 个离线测试，已发布结果用到的 prompt 哈希被测试锁定 |
+| 工程 | 断点续跑；逐次计费（缓存命中、思考 token、高峰 / 低谷单价）与开跑前预估；LLM 响应、向量、重排分数全部按内容寻址缓存；设置不一致拒绝续跑；`--qa-ids` 定向抽查；`--mock` 离线全流程；GPU 半精度与批量编码；GitHub Actions 跑 90 个离线测试，已发布结果用到的 prompt 哈希被测试锁定 |
 
-## 接入 Agent：MCP 服务与 Python 库
+## 接入 Agent：MCP、REST 与 Python 库
 
 评测用的读取路径就是实际使用的那条：`MemoryStore` 把每条消息原样存进 SQLite，读取时在存好的轮次上构建同一个 `HybridRAGSystem`。
 
@@ -104,6 +136,22 @@ claude mcp add memocore -- D:\envs\timeseries\Scripts\memocore.exe mcp --user me
 | `recall` | 按问题取回最相关的若干条，按时间顺序带编号和日期返回，可以直接放进 prompt |
 | `read_memories` | 按编号取回原文，用来核对回答里的引用 |
 | `forget` | 按编号永久删除，连同时间注释和向量一起删；清空整个用户只能通过库或命令行，Agent 不能一键全删 |
+
+**REST 接口**（FastAPI，接口文档在 `/docs`，监听非本机地址时必须设置 `MEMOCORE_SERVER_TOKEN`）：
+
+```bash
+memocore serve --port 8000
+```
+
+```bash
+curl -X POST 127.0.0.1:8000/users/alice/memories -H "Content-Type: application/json" -d "{\"messages\": [{\"text\": \"I adopted a beagle named Max yesterday\"}]}"
+```
+
+```bash
+curl "127.0.0.1:8000/users/alice/recall?query=What%20is%20my%20dog%20called%3F"
+```
+
+并发检索时，`BatchingReranker` 把 3 ms 内到达的重排请求合成一次 GPU 调用（单个请求不等待）。真实 HTTP 压测：并发 16 时吞吐 3.5 → 4.9 次/秒，p95 延迟 5.2 → 3.9 秒；单卡上限受重排计算量限制，详见 [docs/results/serving.md](docs/results/serving.md)。
 
 **作为 Python 库**：
 
@@ -276,6 +324,8 @@ memocore audit-score --csv runs/audit_strict.csv
 | 单次检索 | 16.8 ms | 0.8 ms | 同一段对话的问题批量编码 |
 | 重复完整扫描 | — | 3.5 s | 向量磁盘缓存全部命中 |
 | 第二轮消融（8 种配置 × 3 档预算） | 516 s（第一轮） | 110 s | 重排分数内容寻址缓存 |
+| 并发检索吞吐（HTTP，并发 16） | 3.5 次/秒 | 4.9 次/秒 | 动态合批：3 ms 内的重排请求合成一次 GPU 调用 |
+| 并发检索 p95 延迟（HTTP，并发 8） | 2,625 ms | 1,991 ms | 同上；单个请求不等待，延迟不变 |
 
 ## 路线图
 
@@ -283,7 +333,7 @@ memocore audit-score --csv runs/audit_strict.csv
 2. **冲突感知读取**：同一属性多次变化时，按时间排序返回并标注哪条最新（用 LongMemEval knowledge-update 题验证）。
 3. **带质量门的派生索引**：LLM 抽取的实体卡片、事实，每条都必须能回链到原文轮次并通过忠实性校验。
 4. **重排降本**：只在向量检索不确定时才重排（第 4 轮实测：候选 30 时少 1.2 个点、重排量少 25%）。
-5. **服务化**：MCP 服务和多用户隔离已完成；还差 REST 接口、增量向量索引（用户记忆很多时不必每次重建）、异步写入和压测；接入 RepoPilot。
+5. **服务化**：MCP、REST、多用户隔离、动态合批和压测已完成；还差增量向量索引（用户记忆很多时不必每次重建）、多副本共享存储；接入 RepoPilot。
 6. **更多基准**：LongMemEval 子集、LoCoMo-Refined 交叉评测；以 Mem0 作为外部对照；人工复核裁判盲审的分歧题。
 
 ## 目录
@@ -294,6 +344,7 @@ src/memocore/
   temporal.py          写入时时间锚定（规则，不调用 LLM）
   store.py             持久化记忆库 MemoryStore：SQLite、多用户、按编号取原文、彻底删除
   mcp_server.py        MCP 服务：remember / recall / read_memories / forget
+  http_server.py       REST 接口（FastAPI），可选 Bearer 鉴权
   retrieval/           BM25（含中文二元分词）、RRF 与候选池、交叉编码器重排
   systems/             no_memory、full_context、naive_rag、hybrid_rag
   prompts.py           所有系统共用的回答 prompt（v1～v3，v3 要求引用出处）

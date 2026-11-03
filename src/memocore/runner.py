@@ -111,6 +111,11 @@ def judge_path(run_dir: Path, kind: str) -> Path:
     return run_dir / f"judge_{kind}.jsonl"
 
 
+def judge_variant(kind: str, reasoning: str | None) -> str:
+    """The verdict file's name: a judge run at another thinking level never mixes with the default one."""
+    return kind if reasoning is None else f"{kind}-{reasoning}"
+
+
 def build_embedder(settings: Settings) -> Embedder:
     inner = SentenceTransformerEmbedder(settings.embedding_model, device=settings.embedding_device)
     return CachedEmbedder(inner, settings.embedding_cache_path)
@@ -191,6 +196,8 @@ def run_predictions(
         print(f"回答[{cfg.system}]：已完成 {len(done)} 题，本次调用回答模型 {total} 次", file=sys.stderr)
         if not cfg.mock:
             kind = "answer_full_context" if cfg.system == "full_context" else "answer"
+            if cfg.reasoning == "none":
+                kind += "_no_thinking"
             if line := estimate_line(chat.model, total, kind):
                 print(line, file=sys.stderr)
 
@@ -352,12 +359,13 @@ def run_judge(
     chat: ChatModel | None = None,
     workers: int = 8,
     progress: bool = True,
+    reasoning: str | None = None,
 ) -> Path:
     if kind not in JUDGE_KINDS:
         raise ValueError(f"unknown judge {kind!r}; choose from {', '.join(JUDGE_KINDS)}")
     run_dir = existing_run(settings, run_name)
     info = json.loads((run_dir / RUN_INFO).read_text(encoding="utf-8"))
-    out = judge_path(run_dir, kind)
+    out = judge_path(run_dir, judge_variant(kind, reasoning))
     # Unparsed verdicts are redone; summaries keep the last line written for each question.
     done = {row["qa_id"] for row in read_jsonl(out) if row["label"] is not None}
     todo = [row for row in read_jsonl(run_dir / PREDICTIONS) if row["qa_id"] not in done]
@@ -366,10 +374,13 @@ def run_judge(
         print(f"裁判[{kind}]：待判 {len(todo)} 题，规则直接判定 {by_rule} 题，调用裁判模型 {len(todo) - by_rule} 次",
               file=sys.stderr)
         if not info.get("mock"):
-            if line := estimate_line(settings.judge_model, len(todo) - by_rule, "judge"):
+            estimate_kind = "judge_no_thinking" if reasoning == "none" else "judge"
+            if line := estimate_line(settings.judge_model, len(todo) - by_rule, estimate_kind):
                 print(line, file=sys.stderr)
     # A mock run is graded by the mock judge, so its placeholder answers never reach a paid API.
-    chat = chat or build_chat(settings, settings.judge_model, mock=info.get("mock", False), responder=mock_judge_responder)
+    chat = chat or build_chat(
+        settings, settings.judge_model, mock=info.get("mock", False), responder=mock_judge_responder, reasoning=reasoning
+    )
     with (
         JsonlWriter(out) as writer,
         ThreadPoolExecutor(max_workers=workers) as pool,

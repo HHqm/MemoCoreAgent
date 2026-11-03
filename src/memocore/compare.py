@@ -28,7 +28,8 @@ def _per_question(run_dir: Path, metric: str) -> dict[str, tuple[str, float]]:
 
 
 def compare_runs(settings: Settings, baseline: str, candidate: str, metric: str = "judge_strict") -> dict[str, Any]:
-    if metric not in METRICS:
+    # judge_<kind>-<reasoning> compares verdicts of a judge run at another thinking level.
+    if metric not in METRICS and not (metric.startswith("judge_") and metric.removeprefix("judge_").split("-")[0] in JUDGE_KINDS):
         raise ValueError(f"unknown metric {metric!r}; choose from {', '.join(METRICS)}")
     a = _per_question(existing_run(settings, baseline), metric)
     b = _per_question(existing_run(settings, candidate), metric)

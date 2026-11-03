@@ -17,6 +17,7 @@ dependencies = [
     "nltk>=3.8",
     "tqdm>=4.66",
     "mcp>=1.10",
+    "fastapi>=0.110",
 ]
 
 [project.optional-dependencies]
