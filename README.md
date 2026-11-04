@@ -126,7 +126,7 @@ flowchart LR
 **接入 Claude Code**（其他支持 MCP 的客户端同理）：
 
 ```bash
-claude mcp add memocore -- D:\envs\timeseries\Scripts\memocore.exe mcp --user me
+claude mcp add memocore -- memocore mcp --user me
 ```
 
 服务提供四个工具：
@@ -196,15 +196,15 @@ store.forget("alice")                                         # 删除这个用�
 ## 快速开始
 
 ```bash
-conda activate timeseries
+git clone https://github.com/HHqm/MemoCoreAgent.git
 ```
 
 ```bash
-cd D:\prru\memocore
+cd MemoCoreAgent
 ```
 
 ```bash
-pip install -e . --no-deps
+pip install -e .
 ```
 
 ```bash
